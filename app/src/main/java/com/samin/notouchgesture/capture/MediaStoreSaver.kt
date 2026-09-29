@@ -21,8 +21,10 @@ object MediaStoreSaver {
         }
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
         val copied = runCatching {
-            resolver.openOutputStream(uri)?.use { output -> source.inputStream().use { it.copyTo(output) } } ?: false
-        }.getOrDefault(false)
+          resolver.openOutputStream(uri)?.use { output ->
+                source.inputStream().use { it.copyTo(output) }
+                true
+            } ?: false        }.getOrDefault(false)
         if (!copied) {
             resolver.delete(uri, null, null)
             return false

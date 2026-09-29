@@ -91,7 +91,6 @@ import com.samin.notouchgesture.ui.ThemeMode
 import com.samin.notouchgesture.ui.ThemeStore
 import com.samin.notouchgesture.ui.TransferProgress
 import androidx.camera.view.PreviewView
-import androidx.camera.core.toBitmap
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import java.io.File
