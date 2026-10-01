@@ -1,37 +1,3 @@
-Made the apk! With help of chatgpt and tweaking some github codes!
-Act like a professional app developer to fix and improve the program.
-
-#Indentified problems 
-1.those given screen shots (phone connection )
-2.the open palm tracking is very poor. The camera barely can notice open palms.
-3.the app is bit laggy.
-4.when you  update a permission like u allow camera but the tab 'gesture' shows that option still allow permission, like you need to change tabs to back gesture to make the camera functional.
-5.Big problem : When you try to capture any screen shot then a pop up appears as this app tries to record screen etc (samsung screen record pop up) then when you click 'start now' the app crashes then a pop up says that this app has a bug try clear cache.
-
-#Missing feature
-The camera and the tracking system with screen shot capture and send dosent work in background. Users cant close the app and keep the app running in background then doing his job then in any app any time users can do the hand movements and use the features.
-Key concept: Users can use the features while using others app (main)to capture screen shot of those app's things
-
-#Fix all the indentified problems above
-#Add that missing feature
-#make open palm tracking or detect much easier and faster(actually working)
-#Fix the screen record thing that makes the app crash and make screen shot actually functional and no bug. Also the app mustn't ask for that start now or cancel pop up when shown hand gestures it must capture the screen no hand touch needed to confirm screen shot. It should automatically start screen shot or allow screen shot rather than manuallly pressing button 'start now' on android pop up.
-#Improve 
-
-Change : 
--Rename the apk to "PalmLink"
--Rechange the app icon to "appicon.jpg"
-
-Analyze the full codes all codes, run them
-Find more weaknesses, bugs and typos then fix them, check if theres more problems then fix those, check if its actually fixed-[run these until final completetion.]
-Fix all the github workflow problems and possible problems or errors.
-Check if the actual features are functional if not then fix them again.
-Check everything all above again then find or analyze all problems, errors fix them
-Run these until final best result.
-
-Source: https://github.com/SmallSTUDIO-cloud/notouchgesture
-Source (code and files) :
-The full project files with codes (all) are given in a zip file.
 # No Touch Gesture
 
 Touchless Android prototype for gesture-driven screenshot triggering and nearby screenshot transfer.
