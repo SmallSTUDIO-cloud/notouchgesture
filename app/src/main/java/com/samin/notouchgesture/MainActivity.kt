@@ -16,7 +16,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -83,6 +82,7 @@ import com.samin.notouchgesture.capture.MediaStoreSaver
 import com.samin.notouchgesture.capture.ScreenCaptureService
 import com.samin.notouchgesture.gesture.GestureRecognizerController
 import com.samin.notouchgesture.gesture.GestureStateMachine
+import com.samin.notouchgesture.nearby.NearbyRuntime
 import com.samin.notouchgesture.nearby.NearbyTransferManager
 import com.samin.notouchgesture.ui.NoTouchTheme
 import com.samin.notouchgesture.ui.SectionCard
@@ -93,6 +93,8 @@ import com.samin.notouchgesture.ui.ThemeStore
 import com.samin.notouchgesture.ui.TransferProgress
 import androidx.camera.view.PreviewView
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import java.io.File
 
@@ -103,14 +105,23 @@ class MainActivity : ComponentActivity() {
     private var latestCaptureState = mutableStateOf<File?>(null)
     private var nearbyState = mutableStateOf(NearbyTransferManager.State())
     private var themeState = mutableStateOf(ThemeMode.AUTO)
+    private var backgroundState = mutableStateOf("PalmLink is not running in the background")
+    private var backgroundRunningState = mutableStateOf(ScreenCaptureService.running)
+    private var backgroundGestureState = mutableStateOf(GestureRecognizerController.GestureUiState())
 
     private val captureProjectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             startCaptureService(result.resultCode, result.data!!)
+        } else {
+            ScreenCaptureService.finishStarting()
+            backgroundRunningState.value = false
+            backgroundState.value = "Screen-capture permission was canceled."
         }
     }
 
-    private val permissionsLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+    private val permissionsLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        // Compose refreshes the visible permission state from the lifecycle callback below.
+    }
 
     private val captureReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -118,25 +129,64 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val backgroundStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            intent.getStringExtra(ScreenCaptureService.EXTRA_MESSAGE)?.let { backgroundState.value = it }
+            backgroundRunningState.value = intent.getBooleanExtra(ScreenCaptureService.EXTRA_RUNNING, backgroundRunningState.value)
+        }
+    }
+
+    private val nearbyStateListener: (NearbyTransferManager.State) -> Unit = { state ->
+        runOnUiThread {
+            nearbyState.value = state
+            state.lastReceivedFile?.let { received ->
+                captureStore.saveLatest(received)
+                latestCaptureState.value = received
+            }
+        }
+    }
+
+    private val backgroundGestureReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val label = runCatching {
+                GestureStateMachine.Label.valueOf(intent.getStringExtra(ScreenCaptureService.EXTRA_LABEL) ?: "NONE")
+            }.getOrDefault(GestureStateMachine.Label.NONE)
+            backgroundGestureState.value = GestureRecognizerController.GestureUiState(
+                label = label,
+                confidence = if (intent.hasExtra(ScreenCaptureService.EXTRA_CONFIDENCE)) {
+                    intent.getFloatExtra(ScreenCaptureService.EXTRA_CONFIDENCE, 0f)
+                } else {
+                    null
+                },
+                handQuality = intent.getFloatExtra(ScreenCaptureService.EXTRA_HAND_QUALITY, 0f),
+                message = intent.getStringExtra(ScreenCaptureService.EXTRA_MESSAGE) ?: "Searching for one hand…",
+            )
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         captureStore = CaptureStore(this)
-        nearby = NearbyTransferManager(this)
-        nearby.setStateListener { state ->
-            runOnUiThread {
-                nearbyState.value = state
-                state.lastReceivedFile?.let { received ->
-                    captureStore.saveLatest(received)
-                    latestCaptureState.value = received
-                }
-            }
-        }
+        nearby = NearbyRuntime.get(this)
+        nearby.addStateListener(nearbyStateListener)
         latestCaptureState.value = captureStore.latestFile()
         themeState.value = ThemeStore(this).get()
         ContextCompat.registerReceiver(
             this,
             captureReceiver,
             IntentFilter(ScreenCaptureService.ACTION_CAPTURE_COMPLETE),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        ContextCompat.registerReceiver(
+            this,
+            backgroundStateReceiver,
+            IntentFilter(ScreenCaptureService.ACTION_SERVICE_STATE),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        ContextCompat.registerReceiver(
+            this,
+            backgroundGestureReceiver,
+            IntentFilter(ScreenCaptureService.ACTION_GESTURE_STATE),
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
 
@@ -154,6 +204,9 @@ class MainActivity : ComponentActivity() {
                     onRequestCamera = ::requestCameraPermissions,
                     onRequestNearby = ::requestNearbyPermissions,
                     onRequestCapture = ::requestScreenCapture,
+                    backgroundRunning = backgroundRunningState.value,
+                    backgroundState = backgroundState.value,
+                    backgroundGestureState = backgroundGestureState.value,
                     onStartAdvertising = { nearby.startAdvertising() },
                     onStartDiscovery = { nearby.startDiscovery() },
                     onConfirmConnection = { nearby.confirmPendingConnection() },
@@ -176,22 +229,77 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        nearby.stopAll()
+        if (!ScreenCaptureService.running) {
+            runCatching { nearby.stopAll() }
+        }
+        nearby.removeStateListener(nearbyStateListener)
         runCatching { unregisterReceiver(captureReceiver) }
+        runCatching { unregisterReceiver(backgroundStateReceiver) }
+        runCatching { unregisterReceiver(backgroundGestureReceiver) }
         super.onDestroy()
     }
 
     fun requestScreenCapture() {
+        if (ScreenCaptureService.running) {
+            val intent = Intent(this, ScreenCaptureService::class.java)
+                .setAction(ScreenCaptureService.ACTION_CAPTURE_NOW)
+            runCatching { ContextCompat.startForegroundService(this, intent) }
+                .onFailure { error ->
+                    backgroundState.value = "Could not capture the screen: ${error.message ?: "Android rejected the request"}"
+                }
+            return
+        }
+        if (!ScreenCaptureService.tryBeginStarting()) {
+            backgroundState.value = "PalmLink background mode is already starting."
+            return
+        }
+
         val manager = getSystemService(MediaProjectionManager::class.java)
-        captureProjectionLauncher.launch(manager.createScreenCaptureIntent())
+        if (manager == null) {
+            ScreenCaptureService.finishStarting()
+            backgroundState.value = "Screen capture is unavailable on this device."
+            return
+        }
+        runCatching { captureProjectionLauncher.launch(manager.createScreenCaptureIntent()) }
+            .onFailure { error ->
+                ScreenCaptureService.finishStarting()
+                backgroundState.value = "Could not request screen capture: ${error.message ?: "unknown error"}"
+            }
     }
 
     private fun startCaptureService(resultCode: Int, data: Intent) {
+        if (ScreenCaptureService.running) {
+            ScreenCaptureService.finishStarting()
+            backgroundRunningState.value = true
+            backgroundState.value = "PalmLink is already running in the background."
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            ScreenCaptureService.finishStarting()
+            requestCameraPermissions()
+            return
+        }
+        // Release the foreground CameraX/MediaPipe pipeline first. The controller invokes the
+        // callback only after the current inference has finished and the native recognizer has
+        // been closed, preventing an Activity→service camera race on OEM devices.
         val intent = Intent(this, ScreenCaptureService::class.java).apply {
             putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
             putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, data)
         }
-        ContextCompat.startForegroundService(this, intent)
+        backgroundRunningState.value = false
+        backgroundState.value = "Starting PalmLink background mode…"
+        GestureRecognizerController.stopActive {
+            window.decorView.postDelayed({
+                if (isFinishing || (Build.VERSION.SDK_INT >= 17 && isDestroyed)) return@postDelayed
+                runCatching {
+                    ContextCompat.startForegroundService(this@MainActivity, intent)
+                }.onFailure { error ->
+                    ScreenCaptureService.finishStarting()
+                    backgroundRunningState.value = false
+                    backgroundState.value = "PalmLink could not start: ${error.message ?: "Android rejected the service start"}"
+                }
+            }, 150L)
+        }
     }
 
     private fun requestCameraPermissions() {
@@ -208,8 +316,10 @@ class MainActivity : ComponentActivity() {
                 add(Manifest.permission.BLUETOOTH_SCAN)
                 add(Manifest.permission.BLUETOOTH_CONNECT)
                 add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            } else {
+            } else if (Build.VERSION.SDK_INT >= 29) {
                 add(Manifest.permission.ACCESS_FINE_LOCATION)
+            } else {
+                add(Manifest.permission.ACCESS_COARSE_LOCATION)
             }
             if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
@@ -244,6 +354,9 @@ private fun NoTouchApp(
     onRequestCamera: () -> Unit,
     onRequestNearby: () -> Unit,
     onRequestCapture: () -> Unit,
+    backgroundRunning: Boolean,
+    backgroundState: String,
+    backgroundGestureState: GestureRecognizerController.GestureUiState,
     onStartAdvertising: () -> Unit,
     onStartDiscovery: () -> Unit,
     onConfirmConnection: () -> Unit,
@@ -262,7 +375,7 @@ private fun NoTouchApp(
             TopAppBar(
                 title = {
                     Column {
-                        Text("No Touch Gesture", fontWeight = FontWeight.Bold)
+                        Text("PalmLink", fontWeight = FontWeight.Bold)
                         Text("Touchless control, built responsibly", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 },
@@ -310,6 +423,9 @@ private fun NoTouchApp(
                 modifier = Modifier.padding(padding),
                 onRequestCamera = onRequestCamera,
                 onRequestCapture = onRequestCapture,
+                backgroundRunning = backgroundRunning,
+                backgroundState = backgroundState,
+                backgroundGestureState = backgroundGestureState,
             )
             AppTab.NEARBY -> NearbyScreen(
                 modifier = Modifier.padding(padding),
@@ -333,7 +449,7 @@ private fun NoTouchApp(
             title = { Text("How this prototype works") },
             text = {
                 Text(
-                    "Gesture detection runs locally with the front camera. Capture uses Android MediaProjection, which requires an explicit system consent dialog. Nearby transfer uses an encrypted local peer-to-peer connection. The app does not use hidden background camera access or AccessibilityService tricks."
+                    "Gesture detection runs locally with the front camera. PalmLink uses a user-visible Android foreground service for background gestures and MediaProjection for screen capture. The system requires user consent when background capture is enabled. Nearby transfer stays device-to-device and uses the platform connection authentication flow."
                 )
             },
             confirmButton = { TextButton(onClick = { showInfo = false }) { Text("Done") } },
@@ -363,9 +479,9 @@ private fun HomeScreen(
                 shape = RoundedCornerShape(28.dp),
             ) {
                 Column(Modifier.padding(24.dp)) {
-                    StatusChip("MVP • Android")
+                    StatusChip("PalmLink • Android")
                     Spacer(Modifier.height(14.dp))
-                    Text("Control without touching the screen.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                    Text("Control your screen without touching it.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
                     Text(
                         "Open palm → fist triggers the capture flow. Fist → open palm creates a nearby screenshot offer.",
@@ -382,7 +498,7 @@ private fun HomeScreen(
         item {
             SectionCard(
                 title = "Capture",
-                body = "Use the Gesture Lab to verify the hand mechanism. When the capture sequence is recognized, Android asks for screen-capture consent before taking a screenshot.",
+                body = "Enable PalmLink once, approve Android screen capture, and the foreground service keeps the gesture listener alive while you use other apps.",
                 actionLabel = "Start screen capture",
                 onAction = onCapture,
             )
@@ -435,6 +551,9 @@ private fun LatestCaptureCard(file: File, onSaveGallery: (File) -> Boolean, onDe
             Text("Latest capture", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(10.dp))
             val bitmap = remember(file.absolutePath) { BitmapFactory.decodeFile(file.absolutePath) }
+            DisposableEffect(bitmap) {
+                onDispose { runCatching { bitmap?.recycle() } }
+            }
             if (bitmap != null) {
                 Image(
                     bitmap = bitmap.asImageBitmap(),
@@ -456,17 +575,56 @@ private fun LatestCaptureCard(file: File, onSaveGallery: (File) -> Boolean, onDe
 }
 
 @Composable
-private fun GestureScreen(modifier: Modifier, onRequestCamera: () -> Unit, onRequestCapture: () -> Unit) {
+private fun GestureScreen(
+    modifier: Modifier,
+    onRequestCamera: () -> Unit,
+    onRequestCapture: () -> Unit,
+    backgroundRunning: Boolean,
+    backgroundState: String,
+    backgroundGestureState: GestureRecognizerController.GestureUiState,
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val hasCameraPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+    var hasCameraPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
     var uiState by remember { mutableStateOf(GestureRecognizerController.GestureUiState()) }
     var actionText by remember { mutableStateOf("") }
 
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasCameraPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Column(modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("Gesture Lab", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text("The recognizer requires one clear hand, a stable gesture for a moment, and a neutral release after an action.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("The recognizer uses the front camera locally. PalmLink can keep the gesture listener alive in a visible foreground service while you use another app.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+            Column(Modifier.padding(18.dp)) {
+                Text("Background mode", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(6.dp))
+                Text(backgroundState)
+                Spacer(Modifier.height(10.dp))
+                if (!backgroundRunning) {
+                    Button(onClick = onRequestCapture, enabled = hasCameraPermission) {
+                        Icon(Icons.Filled.ScreenShare, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Enable PalmLink")
+                    }
+                } else {
+                    StatusChip("RUNNING IN BACKGROUND")
+                    Spacer(Modifier.height(8.dp))
+                    Text("Open palm → fist captures the current screen. A persistent notification provides the stop control.")
+                    Spacer(Modifier.height(8.dp))
+                    Text("${backgroundGestureState.message}")
+                }
+            }
+        }
 
         if (!hasCameraPermission) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
@@ -480,7 +638,7 @@ private fun GestureScreen(modifier: Modifier, onRequestCamera: () -> Unit, onReq
                     Button(onClick = onRequestCamera) { Text("Allow camera") }
                 }
             }
-        } else {
+        } else if (!backgroundRunning) {
             Surface(
                 shape = RoundedCornerShape(26.dp),
                 modifier = Modifier.fillMaxWidth().height(390.dp).border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(26.dp)),
@@ -497,7 +655,11 @@ private fun GestureScreen(modifier: Modifier, onRequestCamera: () -> Unit, onReq
                     Column(Modifier.align(Alignment.TopStart).padding(16.dp)) {
                         StatusChip(uiState.message)
                         Spacer(Modifier.height(8.dp))
-                        Text("Confidence ${(uiState.confidence * 100).toInt()}%", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            uiState.confidence?.let { "Confidence ${(it.coerceIn(0f, 1f) * 100).toInt()}%" }
+                                ?: "Confidence unavailable",
+                            style = MaterialTheme.typography.labelMedium,
+                        )
                     }
                     Text(
                         when (uiState.label) {
@@ -515,15 +677,15 @@ private fun GestureScreen(modifier: Modifier, onRequestCamera: () -> Unit, onReq
             Button(onClick = onRequestCapture, modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Filled.ScreenShare, null)
                 Spacer(Modifier.width(8.dp))
-                Text("Test Android capture permission")
+                Text("Re-authorize screen capture")
             }
             if (actionText.isNotBlank()) Text(actionText, color = MaterialTheme.colorScheme.primary)
         }
     }
 
-    DisposableEffect(previewView, hasCameraPermission) {
+    DisposableEffect(previewView, hasCameraPermission, backgroundRunning) {
         val pv = previewView
-        if (!hasCameraPermission || pv == null) {
+        if (!hasCameraPermission || pv == null || backgroundRunning) {
             onDispose { }
         } else {
             val controller = GestureRecognizerController(
@@ -564,7 +726,19 @@ private fun NearbyScreen(
     onAcceptOffer: () -> Unit,
 ) {
     val context = LocalContext.current
-    val hasNearby = nearbyPermissionsGranted(context)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var hasNearby by remember { mutableStateOf(nearbyPermissionsGranted(context)) }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasNearby = nearbyPermissionsGranted(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Column(modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("Nearby", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         Text("Pair locally, offer a screenshot, then accept it with a gesture. No cloud account required.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -715,7 +889,11 @@ private fun NearbyGesturePanel(
                             Column(Modifier.align(Alignment.TopStart).padding(12.dp)) {
                                 StatusChip(gestureState.message)
                                 Spacer(Modifier.height(4.dp))
-                                Text("Confidence ${(gestureState.confidence * 100).toInt()}%", style = MaterialTheme.typography.labelSmall)
+                                Text(
+                                    gestureState.confidence?.let { "Confidence ${(it * 100).toInt()}%" }
+                                        ?: "Confidence unavailable",
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
                             }
                         }
                     }
@@ -768,8 +946,10 @@ private fun nearbyPermissionsGranted(context: Context): Boolean {
             add(Manifest.permission.BLUETOOTH_SCAN)
             add(Manifest.permission.BLUETOOTH_CONNECT)
             add(Manifest.permission.BLUETOOTH_ADVERTISE)
-        } else {
+        } else if (Build.VERSION.SDK_INT >= 29) {
             add(Manifest.permission.ACCESS_FINE_LOCATION)
+        } else {
+            add(Manifest.permission.ACCESS_COARSE_LOCATION)
         }
         if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.NEARBY_WIFI_DEVICES)
     }

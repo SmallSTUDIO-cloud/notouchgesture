@@ -1,50 +1,64 @@
-# No Touch Gesture
+# PalmLink
 
-Touchless Android prototype for gesture-driven screenshot triggering and nearby screenshot transfer.
+Touchless Android app for gesture-driven screen capture and nearby screenshot transfer.
 
-## What this build actually does
+## What this build does
 
 - Uses the front camera + MediaPipe Gesture Recognizer to detect `Open_Palm` and `Closed_Fist`.
-- Uses a debounced state machine instead of raw gesture labels, reducing false triggers.
+- Uses a debounced state machine for deliberate gesture sequences.
 - Capture sequence: **Open palm → closed fist**.
-- Send sequence: **Closed fist → open palm**.
-- Receive sequence: **Open palm** after a pending transfer offer.
-- Uses Android MediaProjection for screen capture and Android Nearby Connections for local peer-to-peer transfer.
-- Includes Auto / Light / Dark appearance selection in the top app bar.
-- Saves the latest capture privately and can export it to the gallery or share it with another Android app.
+- Send sequence: **Closed fist → open palm** when an authenticated Nearby connection exists.
+- Receive sequence: **Open palm** when a transfer offer is pending.
+- Runs gesture recognition from a visible Android foreground service so the user can leave PalmLink and use another app.
+- Keeps one user-approved MediaProjection session alive while background mode is enabled, so a gesture does not launch a new screen-recording consent dialog.
+- Uses Android MediaProjection for screen capture and Nearby Connections for local peer-to-peer transfer.
+- Saves the latest capture privately and can export it to Pictures or the Android share sheet.
 
 ## Important Android constraint
 
-Modern Android requires explicit user consent for MediaProjection screen capture. A normal camera activity also cannot silently capture another app's screen. This project therefore does **not** pretend to implement a hidden global gesture overlay. The Gesture Lab is fully testable inside the app, while screen capture uses the official Android consent flow.
+Android does not allow an ordinary app to silently grant itself MediaProjection permission or click the system's screen-capture consent dialog. The user must approve screen capture when **PalmLink background mode is enabled**. After that approval, PalmLink keeps the authorized projection session alive in its user-visible foreground service and captures the next screen frame when the gesture fires. If the service is stopped or Android revokes the projection, the user must approve a new session.
 
-A global, no-touch capture experience needs an OS-level integration that is appropriate for the product's distribution model. Do not ship an AccessibilityService merely as a workaround for screenshot access.
+Android also restricts starting camera foreground services from the background. PalmLink therefore starts its camera foreground service only from a visible user action while the app has camera permission, then the service may continue using the camera while the user switches to another app.
 
-## Run
+## Gesture performance changes
+
+- Lowered MediaPipe hand detection/presence/tracking thresholds to 0.35.
+- Limited recognition to the two gestures PalmLink actually uses.
+- The state machine accepts 0.50+ confidence; the MediaPipe canned classifier is not blocked by an aggressive score threshold, and a landmark fallback covers temporary classifier gaps.
+- Reduced camera analysis resolution to 640×480 and kept only the newest frame.
+- Relaxed the old hand-size/framing gate so a reasonably sized hand farther from the camera is still usable.
+- Reduced stable dwell and rearm timing while retaining a deliberate sequence requirement.
+
+## Nearby background behavior
+
+The foreground service and Activity share one process-local Nearby manager. The Nearby screen explicitly chooses the advertiser or discoverer role, role switches stop the previous operation first, and duplicate start callbacks are ignored. Background mode does not start both roles automatically, so it cannot recreate the old 8001/8002 duplicate-operation loop. Existing authenticated connections remain available after the Activity is closed. Connection authentication still requires both devices to accept the connection.
+
+## Build
 
 ### Android Studio
 
-Open this folder as a Gradle project. The build downloads the MediaPipe gesture model into `app/src/main/assets/` if it is not already present.
+Open the project as a Gradle project. The build downloads the official MediaPipe gesture model into `app/src/main/assets/gesture_recognizer.task` when it is missing.
 
 ### GitHub Actions
 
-This repository includes `.github/workflows/android-build.yml`, which installs Gradle 9.5 on the runner and produces `app-debug.apk` as a build artifact. This is useful when working from a mobile-only workflow.
+The workflow installs the Android SDK packages explicitly, installs Gradle 9.5.0, builds the debug APK, and uploads `PalmLink-debug-apk`.
 
-## Manual test flow
+## Manual device test
 
-1. Install the debug APK on two Android devices.
-2. On device A, open **Gesture Lab** and grant camera permission.
-3. Verify the status moves from `Searching` to `Ready` while one hand is centered in frame.
-4. Test **Open palm → fist**. The app should raise the Android screen-capture consent dialog.
-5. Grant consent. A capture should be saved and shown in the app.
-6. On device A/B, open **Nearby**. One device advertises while the other discovers.
-7. Establish the connection while both devices are in the transfer screen. The auth digits are shown for comparison.
-8. On the sender, ensure a capture exists and perform **Fist → Open palm** to create a transfer offer.
-9. On the receiver, perform **Open palm** to accept the pending offer.
-10. Confirm the received image appears in the receiver's capture history and can be exported.
+1. Install the debug APK.
+2. Grant camera permission.
+3. Open Gesture and tap **Enable PalmLink**.
+4. Approve Android's screen-capture dialog once.
+5. Wait for the persistent PalmLink notification.
+6. Leave PalmLink and open another app.
+7. Show an open palm, hold briefly, then make a fist. The current screen should be captured without another screen-capture consent dialog.
+8. If Nearby permissions are granted and a previously authenticated connection exists, closed fist → open palm sends the latest capture.
+9. On a device with a pending offer, open palm accepts it.
+10. Use the notification's **Stop** action to disable background mode.
 
-## Known scope limits
+## Known platform limits
 
-- This is an Android-first prototype, not a polished production release.
-- No cloud backend is used.
-- The app intentionally avoids background camera capture and AccessibilityService-based screen scraping.
-- The first production release should add stronger device pairing/trust, transfer resume, lifecycle recovery, instrumentation tests on physical devices, and a dedicated global-capture architecture backed by platform permissions that are explicitly justified to users.
+- Android's MediaProjection consent cannot be bypassed programmatically.
+- Camera access in the background requires a user-visible foreground service and the appropriate camera permission.
+- Some OEMs may aggressively stop foreground services or camera use. Battery-optimization settings may affect long sessions.
+- Physical-device validation is still required for Samsung/Oppo/Xiaomi and multiple Android versions.
