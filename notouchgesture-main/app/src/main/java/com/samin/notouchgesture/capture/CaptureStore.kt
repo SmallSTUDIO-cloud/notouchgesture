@@ -5,8 +5,6 @@ import java.io.File
 
 class CaptureStore(context: Context) {
     private val prefs = context.getSharedPreferences("capture_store", Context.MODE_PRIVATE)
-    private val captureDir = File(context.filesDir, "captures").apply { mkdirs() }
-
     fun latestFile(): File? = prefs.getString(KEY_LATEST, null)?.let(::File)?.takeIf { it.exists() }
 
     fun saveLatest(file: File) {

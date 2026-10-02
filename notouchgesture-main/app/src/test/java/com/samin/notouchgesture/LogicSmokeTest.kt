@@ -1,20 +1,26 @@
 package com.samin.notouchgesture
 
 import com.samin.notouchgesture.gesture.GestureStateMachine
+import com.samin.notouchgesture.gesture.GestureRecognizerController
 import com.samin.notouchgesture.nearby.TransferMessage
 import com.samin.notouchgesture.nearby.TransferProtocol
+import org.junit.Test
 
-fun main() {
-    captureSequenceWorks()
-    lowConfidenceDoesNotTrigger()
-    triggerNeedsNeutralRelease()
-    sendSequenceWorks()
-    receiveGestureWorks()
-    backgroundCaptureAndSendWork()
-    backgroundReceiveTakesPriority()
-    wrongOrderDoesNotTrigger()
-    protocolRoundTripWorks()
-    println("LOGIC_SMOKE_TEST: PASS")
+class LogicSmokeTest {
+    @Test fun captureSequenceWorksTest() = captureSequenceWorks()
+    @Test fun lowConfidenceDoesNotTriggerTest() = lowConfidenceDoesNotTrigger()
+    @Test fun triggerNeedsNeutralReleaseTest() = triggerNeedsNeutralRelease()
+    @Test fun sendSequenceWorksTest() = sendSequenceWorks()
+    @Test fun receiveGestureWorksTest() = receiveGestureWorks()
+    @Test fun backgroundCaptureAndSendWorkTest() = backgroundCaptureAndSendWork()
+    @Test fun backgroundReceiveTakesPriorityTest() = backgroundReceiveTakesPriority()
+    @Test fun backgroundReceiveArrivingAfterStablePalmWorksTest() = backgroundReceiveArrivingAfterStablePalmWorks()
+    @Test fun wrongOrderDoesNotTriggerTest() = wrongOrderDoesNotTrigger()
+    @Test fun protocolRoundTripWorksTest() = protocolRoundTripWorks()
+    @Test fun invalidOfferSizeIsRejectedTest() = invalidOfferSizeIsRejected()
+    @Test fun missingGestureResultHasNoConfidenceTest() {
+        check(GestureRecognizerController.GestureUiState().confidence == null)
+    }
 }
 
 private fun captureSequenceWorks() {
@@ -77,6 +83,18 @@ private fun backgroundReceiveTakesPriority() {
     val sm = GestureStateMachine(GestureStateMachine.GestureMode.BACKGROUND, stableMs = 100)
     check(sm.update(GestureStateMachine.Label.OPEN_PALM, 0.9f, 0L, receivePending = true) == GestureStateMachine.Action.NONE)
     check(sm.update(GestureStateMachine.Label.OPEN_PALM, 0.9f, 100L, receivePending = true) == GestureStateMachine.Action.RECEIVE_ACCEPT)
+}
+
+private fun invalidOfferSizeIsRejected() {
+    check(TransferProtocol.decode("OFFER|capture.png|0".toByteArray()) == null)
+    check(TransferProtocol.decode("OFFER|capture.png|-12".toByteArray()) == null)
+}
+
+private fun backgroundReceiveArrivingAfterStablePalmWorks() {
+    val sm = GestureStateMachine(GestureStateMachine.GestureMode.BACKGROUND, stableMs = 100)
+    check(sm.update(GestureStateMachine.Label.OPEN_PALM, 0.9f, 0L, receivePending = false) == GestureStateMachine.Action.NONE)
+    check(sm.update(GestureStateMachine.Label.OPEN_PALM, 0.9f, 100L, receivePending = false) == GestureStateMachine.Action.ARMED)
+    check(sm.update(GestureStateMachine.Label.OPEN_PALM, 0.9f, 250L, receivePending = true) == GestureStateMachine.Action.RECEIVE_ACCEPT)
 }
 
 private fun wrongOrderDoesNotTrigger() {

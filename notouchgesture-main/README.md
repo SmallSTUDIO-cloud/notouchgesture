@@ -22,16 +22,16 @@ Android also restricts starting camera foreground services from the background. 
 
 ## Gesture performance changes
 
-- Lowered MediaPipe hand detection/presence/tracking thresholds to 0.45.
+- Lowered MediaPipe hand detection/presence/tracking thresholds to 0.35.
 - Limited recognition to the two gestures PalmLink actually uses.
-- Reduced gesture classifier threshold to 0.35.
+- The state machine accepts 0.50+ confidence; the MediaPipe canned classifier is not blocked by an aggressive score threshold, and a landmark fallback covers temporary classifier gaps.
 - Reduced camera analysis resolution to 640×480 and kept only the newest frame.
 - Relaxed the old hand-size/framing gate so a reasonably sized hand farther from the camera is still usable.
 - Reduced stable dwell and rearm timing while retaining a deliberate sequence requirement.
 
 ## Nearby background behavior
 
-The foreground service and Activity share one process-local Nearby manager. When Nearby permissions are already granted, background mode keeps advertising/discovery alive. Existing authenticated connections can therefore remain available after the Activity is closed. Connection authentication still requires both devices to accept the connection.
+The foreground service and Activity share one process-local Nearby manager. The Nearby screen explicitly chooses the advertiser or discoverer role, role switches stop the previous operation first, and duplicate start callbacks are ignored. Background mode does not start both roles automatically, so it cannot recreate the old 8001/8002 duplicate-operation loop. Existing authenticated connections remain available after the Activity is closed. Connection authentication still requires both devices to accept the connection.
 
 ## Build
 

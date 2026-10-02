@@ -10,10 +10,10 @@ package com.samin.notouchgesture.gesture
  */
 class GestureStateMachine(
     private val mode: GestureMode,
-    private val minConfidence: Float = 0.55f,
-    private val stableMs: Long = 240L,
-    private val neutralRearmMs: Long = 220L,
-    private val cooldownMs: Long = 700L,
+    private val minConfidence: Float = 0.50f,
+    private val stableMs: Long = 220L,
+    private val neutralRearmMs: Long = 180L,
+    private val cooldownMs: Long = 600L,
 ) {
     enum class GestureMode { CAPTURE, SEND, RECEIVE, BACKGROUND }
 
@@ -60,7 +60,18 @@ class GestureStateMachine(
         }
 
         if (nowMs - candidateSince < stableMs) return Action.NONE
-        if (currentStable == effective && !waitingForNeutral) return Action.NONE
+
+        val backgroundReceiveReady = mode == GestureMode.BACKGROUND &&
+            receivePending &&
+            effective == Label.OPEN_PALM &&
+            !waitingForNeutral
+
+        // A background receive offer may arrive after the user's open palm has already
+        // become stable. Keep that path eligible even when a send/capture sequence had
+        // previously been armed, because a pending receive has explicit priority.
+        if (!backgroundReceiveReady && currentStable == effective && !waitingForNeutral) {
+            return Action.NONE
+        }
 
         currentStable = effective
 
@@ -81,6 +92,10 @@ class GestureStateMachine(
         }
 
         if (lastActionAt != Long.MIN_VALUE && nowMs - lastActionAt < cooldownMs) return Action.NONE
+
+        if (backgroundReceiveReady) {
+            return trigger(Action.RECEIVE_ACCEPT, nowMs)
+        }
 
         return when (mode) {
             GestureMode.CAPTURE -> handleCapture(effective, nowMs)

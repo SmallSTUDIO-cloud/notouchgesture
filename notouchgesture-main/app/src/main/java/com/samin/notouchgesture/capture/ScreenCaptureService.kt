@@ -13,8 +13,7 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
+import android.os.HandlerThread
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -29,9 +28,10 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Keeps one user-approved screen projection alive and listens for PalmLink gestures. */
+/** Keeps one user-approved MediaProjection session alive and listens for PalmLink gestures. */
 class ScreenCaptureService : LifecycleService() {
-    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var captureThread: HandlerThread
+    private lateinit var captureHandler: Handler
     private val captureRequested = AtomicBoolean(false)
 
     private var projection: MediaProjection? = null
@@ -40,10 +40,13 @@ class ScreenCaptureService : LifecycleService() {
     private var projectionCallback: MediaProjection.Callback? = null
     private var gestureController: GestureRecognizerController? = null
     private var foregroundStarted = false
-    private var nearbyPendingOffer = false
+    @Volatile private var nearbyPendingOffer = false
+    @Volatile private var gestureReady = false
     private lateinit var nearby: NearbyTransferManager
+    private lateinit var captureStore: CaptureStore
+
     private val nearbyStateListener: (NearbyTransferManager.State) -> Unit = { state ->
-        state.lastReceivedFile?.let { CaptureStore(this).saveLatest(it) }
+        state.lastReceivedFile?.let(captureStore::saveLatest)
         nearbyPendingOffer = state.pendingOffer != null
         broadcastNearbyState(state)
     }
@@ -52,12 +55,17 @@ class ScreenCaptureService : LifecycleService() {
         @Volatile
         var running: Boolean = false
             private set
+        private val startupInProgress = AtomicBoolean(false)
+
+        fun tryBeginStarting(): Boolean = startupInProgress.compareAndSet(false, true)
+
+        fun finishStarting() {
+            startupInProgress.set(false)
+        }
 
         const val ACTION_CAPTURE_COMPLETE = "com.samin.notouchgesture.CAPTURE_COMPLETE"
         const val ACTION_SERVICE_STATE = "com.samin.notouchgesture.SERVICE_STATE"
         const val ACTION_GESTURE_STATE = "com.samin.notouchgesture.GESTURE_STATE"
-        const val ACTION_GESTURE_SEND = "com.samin.notouchgesture.GESTURE_SEND"
-        const val ACTION_GESTURE_RECEIVE = "com.samin.notouchgesture.GESTURE_RECEIVE"
         const val ACTION_NEARBY_STATE = "com.samin.notouchgesture.NEARBY_STATE"
         const val ACTION_CAPTURE_NOW = "com.samin.notouchgesture.CAPTURE_NOW"
         const val ACTION_STOP = "com.samin.notouchgesture.STOP"
@@ -78,15 +86,20 @@ class ScreenCaptureService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
-        running = true
-        createNotificationChannel()
+        captureThread = HandlerThread("PalmLink-Capture").also { it.start() }
+        captureHandler = Handler(captureThread.looper)
+        captureStore = CaptureStore(this)
         nearby = NearbyRuntime.get(this)
         nearby.addStateListener(nearbyStateListener)
+        running = false
+        createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_STOP -> {
+                finishStarting()
                 broadcastState("PalmLink stopped.", running = false)
                 stopSelf()
                 return START_NOT_STICKY
@@ -97,29 +110,59 @@ class ScreenCaptureService : LifecycleService() {
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
         val resultData = intent?.getParcelableExtraCompat<Intent>(EXTRA_RESULT_DATA)
 
-        // Commands may arrive after the projection session is already running.
-        if (resultCode == -1 || resultData == null) {
-            return if (foregroundStarted) START_NOT_STICKY else {
-                stopSelf()
-                START_NOT_STICKY
+        // A running service may receive a command without new MediaProjection consent.
+        if (projection != null) {
+            finishStarting()
+            if (!running) {
+                running = true
+                broadcastState("PalmLink is active. Use open palm → fist to capture.")
             }
+            return START_NOT_STICKY
+        }
+
+        if (resultCode == -1 || resultData == null) {
+            finishStarting()
+            if (!foregroundStarted) {
+                broadcastState("Screen capture permission is required to enable PalmLink.", running = false)
+                stopSelf()
+            }
+            return START_NOT_STICKY
         }
 
         if (!hasCameraPermission()) {
+            finishStarting()
             broadcastState("Camera permission is required for background gestures.", running = false)
             stopSelf()
             return START_NOT_STICKY
         }
 
         try {
+            // Android checks the declared FGS type prerequisites at promotion time. The
+            // Activity starts this service immediately after the user's visible consent flow.
             startAsForeground()
             startProjection(resultCode, resultData)
             startGestureRecognition()
-            startNearbyIfPermitted()
+            // The service is considered fully active only after CameraX has bound.
+            // Until then the notification/state says that startup is still in progress.
+            if (gestureReady) {
+                finishStarting()
+                running = true
+                broadcastState("PalmLink is active. Use open palm → fist to capture.")
+            } else {
+                broadcastState("Starting camera gesture engine…", running = false)
+            }
         } catch (error: SecurityException) {
+            finishStarting()
+            running = false
+            stopGestureRecognition()
+            cleanupProjection()
             broadcastState("PalmLink could not start: ${error.message ?: "permission denied"}", running = false)
             stopSelf()
         } catch (error: Exception) {
+            finishStarting()
+            running = false
+            stopGestureRecognition()
+            cleanupProjection()
             broadcastState("PalmLink could not start: ${error.message ?: "unknown error"}", running = false)
             stopSelf()
         }
@@ -129,14 +172,17 @@ class ScreenCaptureService : LifecycleService() {
 
     private fun startAsForeground() {
         if (foregroundStarted) return
-        val types = if (Build.VERSION.SDK_INT >= 29) {
-            var value = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            if (hasNearbyPermissions()) {
-                value = value or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+
+        // Keep the foreground service scope limited to the two capabilities this service
+        // actually uses. Nearby runs through the shared client and does not need the
+        // connectedDevice FGS type here, which removes an unnecessary runtime prerequisite.
+        val types = when {
+            Build.VERSION.SDK_INT >= 29 -> {
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             }
-            value
-        } else 0
+            else -> 0
+        }
 
         if (Build.VERSION.SDK_INT >= 29) {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification(), types)
@@ -151,34 +197,46 @@ class ScreenCaptureService : LifecycleService() {
 
         val manager = getSystemService(MediaProjectionManager::class.java)
             ?: error("MediaProjection service unavailable")
-        projection = manager.getMediaProjection(resultCode, data)
+        val newProjection = manager.getMediaProjection(resultCode, data)
             ?: error("MediaProjection permission was not granted")
 
         projectionCallback = object : MediaProjection.Callback() {
             override fun onStop() {
-                broadcastState("Screen capture permission was revoked. Re-enable PalmLink.", running = false)
+                running = false
+                broadcastState("Screen capture permission ended. Enable PalmLink again.", running = false)
                 cleanupProjection(stopProjection = false)
                 stopSelf()
             }
         }
-        projection!!.registerCallback(projectionCallback!!, handler)
+        newProjection.registerCallback(projectionCallback!!, captureHandler)
+        projection = newProjection
 
         val metrics = resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
+        val width = metrics.widthPixels.coerceAtLeast(1)
+        val height = metrics.heightPixels.coerceAtLeast(1)
+        val density = metrics.densityDpi.coerceAtLeast(1)
 
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
         imageReader!!.setOnImageAvailableListener({ reader ->
-            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            val image = try {
+                reader.acquireLatestImage()
+            } catch (error: Exception) {
+                captureRequested.set(false)
+                if (projection != null) {
+                    running = false
+                    broadcastState("Screen capture failed: ${error.message ?: "could not read a screen frame"}", running = false)
+                    stopSelf()
+                }
+                return@setOnImageAvailableListener
+            } ?: return@setOnImageAvailableListener
             if (!captureRequested.compareAndSet(true, false)) {
                 image.close()
                 return@setOnImageAvailableListener
             }
             saveProjectionImage(image, width)
-        }, handler)
+        }, captureHandler)
 
-        virtualDisplay = projection!!.createVirtualDisplay(
+        virtualDisplay = newProjection.createVirtualDisplay(
             "PalmLinkScreenCapture",
             width,
             height,
@@ -186,13 +244,13 @@ class ScreenCaptureService : LifecycleService() {
             android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader!!.surface,
             null,
-            handler,
-        )
-        broadcastState("PalmLink is active. Use open palm → fist to capture.")
+            captureHandler,
+        ) ?: error("Could not create the screen capture display")
     }
 
     private fun startGestureRecognition() {
         if (gestureController != null) return
+        gestureReady = false
         gestureController = GestureRecognizerController(
             context = this,
             lifecycleOwner = this,
@@ -202,12 +260,26 @@ class ScreenCaptureService : LifecycleService() {
                 broadcastGestureState(state.label.name, state.confidence, state.handQuality, state.message)
             },
             receivePending = { nearbyPendingOffer },
+            onReady = {
+                gestureReady = true
+                finishStarting()
+                if (projection != null && foregroundStarted) {
+                    running = true
+                    broadcastState("PalmLink is active. Use open palm → fist to capture.")
+                }
+            },
+            onFatalError = { message ->
+                finishStarting()
+                if (!running) {
+                    gestureReady = false
+                    broadcastState(message, running = false)
+                    stopSelf()
+                }
+            },
             onAction = { action ->
                 when (action) {
                     GestureStateMachine.Action.CAPTURE -> requestCapture("gesture")
-                    GestureStateMachine.Action.SEND_OFFER -> {
-                        CaptureStore(this).latestFile()?.let { nearby.sendOffer(it) }
-                    }
+                    GestureStateMachine.Action.SEND_OFFER -> captureStore.latestFile()?.let(nearby::sendOffer)
                     GestureStateMachine.Action.RECEIVE_ACCEPT -> nearby.acceptPendingOffer()
                     GestureStateMachine.Action.ARMED,
                     GestureStateMachine.Action.NONE -> Unit
@@ -219,7 +291,7 @@ class ScreenCaptureService : LifecycleService() {
 
     private fun requestCapture(source: String) {
         if (projection == null || imageReader == null) {
-            broadcastState("Screen capture is not ready. Re-enable PalmLink first.")
+            broadcastState("Screen capture is not ready. Enable PalmLink again.")
             return
         }
         if (!captureRequested.compareAndSet(false, true)) return
@@ -227,24 +299,33 @@ class ScreenCaptureService : LifecycleService() {
     }
 
     private fun saveProjectionImage(image: Image, width: Int) {
+        var bitmap: Bitmap? = null
+        var cropped: Bitmap? = null
         try {
             val plane = image.planes.firstOrNull() ?: return
             val pixelStride = plane.pixelStride
             val rowStride = plane.rowStride
+            if (pixelStride <= 0 || rowStride <= 0) return
+
             val rowPadding = rowStride - pixelStride * width
-            val paddedWidth = width + rowPadding / pixelStride
-            val bitmap = Bitmap.createBitmap(paddedWidth, image.height, Bitmap.Config.ARGB_8888)
+            val paddedWidth = (width + rowPadding / pixelStride).coerceAtLeast(width)
+            bitmap = Bitmap.createBitmap(paddedWidth, image.height, Bitmap.Config.ARGB_8888)
             bitmap.copyPixelsFromBuffer(plane.buffer)
-            val cropped = if (paddedWidth == width) bitmap else Bitmap.createBitmap(bitmap, 0, 0, width, image.height)
-            if (cropped !== bitmap) bitmap.recycle()
+            cropped = if (paddedWidth == width) bitmap else Bitmap.createBitmap(bitmap, 0, 0, width, image.height)
 
             val dir = File(filesDir, "captures").apply { mkdirs() }
             val output = File(dir, "capture-${System.currentTimeMillis()}.png")
-            FileOutputStream(output).use { stream ->
-                cropped.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            val written = FileOutputStream(output).use { stream ->
+                cropped!!.compress(Bitmap.CompressFormat.PNG, 100, stream)
             }
-            cropped.recycle()
-            CaptureStore(this).saveLatest(output)
+
+            if (!written) {
+                output.delete()
+                broadcastState("Screenshot failed: could not encode the screen image")
+                return
+            }
+
+            captureStore.saveLatest(output)
             sendBroadcast(
                 Intent(ACTION_CAPTURE_COMPLETE)
                     .setPackage(packageName)
@@ -254,28 +335,10 @@ class ScreenCaptureService : LifecycleService() {
         } catch (error: Exception) {
             broadcastState("Screenshot failed: ${error.message ?: "could not read screen frame"}")
         } finally {
+            if (cropped != null && cropped !== bitmap) runCatching { cropped.recycle() }
+            if (bitmap != null) runCatching { bitmap.recycle() }
             image.close()
         }
-    }
-
-    private fun startNearbyIfPermitted() {
-        if (!hasNearbyPermissions()) return
-        nearby.startAdvertising()
-        nearby.startDiscovery()
-    }
-
-    private fun hasNearbyPermissions(): Boolean {
-        val permissions = buildList {
-            if (Build.VERSION.SDK_INT >= 31) {
-                add(Manifest.permission.BLUETOOTH_SCAN)
-                add(Manifest.permission.BLUETOOTH_CONNECT)
-                add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            } else {
-                add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
-            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.NEARBY_WIFI_DEVICES)
-        }
-        return permissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
     }
 
     private fun broadcastNearbyState(state: NearbyTransferManager.State) {
@@ -288,8 +351,15 @@ class ScreenCaptureService : LifecycleService() {
         )
     }
 
+    private fun stopGestureRecognition() {
+        gestureReady = false
+        gestureController?.stop()
+        gestureController = null
+    }
+
     private fun cleanupProjection(stopProjection: Boolean = true) {
         captureRequested.set(false)
+        runCatching { imageReader?.setOnImageAvailableListener(null, null) }
         runCatching { virtualDisplay?.release() }
         runCatching { imageReader?.close() }
         virtualDisplay = null
@@ -307,16 +377,22 @@ class ScreenCaptureService : LifecycleService() {
 
     override fun onDestroy() {
         running = false
-        gestureController?.stop()
-        gestureController = null
+        finishStarting()
+        stopGestureRecognition()
         nearby.removeStateListener(nearbyStateListener)
         cleanupProjection()
         foregroundStarted = false
-        sendBroadcast(Intent(ACTION_SERVICE_STATE).setPackage(packageName).putExtra(EXTRA_MESSAGE, "PalmLink stopped.").putExtra(EXTRA_RUNNING, false))
+        runCatching { if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE) }
+        if (::captureHandler.isInitialized) captureHandler.removeCallbacksAndMessages(null)
+        if (::captureThread.isInitialized) captureThread.quitSafely()
+        sendBroadcast(
+            Intent(ACTION_SERVICE_STATE)
+                .setPackage(packageName)
+                .putExtra(EXTRA_MESSAGE, "PalmLink stopped.")
+                .putExtra(EXTRA_RUNNING, false),
+        )
         super.onDestroy()
     }
-
-    override fun onBind(intent: Intent): IBinder? = null
 
     private fun hasCameraPermission(): Boolean =
         ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -329,7 +405,7 @@ class ScreenCaptureService : LifecycleService() {
         .setSilent(true)
         .addAction(
             NotificationCompat.Action.Builder(
-                0,
+                R.drawable.ic_launcher,
                 "Stop",
                 android.app.PendingIntent.getService(
                     this,
@@ -342,13 +418,18 @@ class ScreenCaptureService : LifecycleService() {
         .build()
 
     private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = getSystemService<NotificationManager>() ?: return
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, getString(R.string.capture_channel_name), NotificationManager.IMPORTANCE_LOW),
+            NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.capture_channel_name),
+                NotificationManager.IMPORTANCE_LOW,
+            ),
         )
     }
 
-    private fun broadcastState(message: String, running: Boolean = true) {
+    private fun broadcastState(message: String, running: Boolean = ScreenCaptureService.running) {
         sendBroadcast(
             Intent(ACTION_SERVICE_STATE)
                 .setPackage(packageName)
@@ -357,19 +438,14 @@ class ScreenCaptureService : LifecycleService() {
         )
     }
 
-    private fun broadcastGestureState(label: String, confidence: Float, handQuality: Float, message: String) {
-        sendBroadcast(
-            Intent(ACTION_GESTURE_STATE)
-                .setPackage(packageName)
-                .putExtra(EXTRA_LABEL, label)
-                .putExtra(EXTRA_CONFIDENCE, confidence)
-                .putExtra(EXTRA_HAND_QUALITY, handQuality)
-                .putExtra(EXTRA_MESSAGE, message),
-        )
-    }
-
-    private fun broadcastGestureAction(action: String) {
-        sendBroadcast(Intent(action).setPackage(packageName))
+    private fun broadcastGestureState(label: String, confidence: Float?, handQuality: Float, message: String) {
+        val intent = Intent(ACTION_GESTURE_STATE)
+            .setPackage(packageName)
+            .putExtra(EXTRA_LABEL, label)
+            .putExtra(EXTRA_HAND_QUALITY, handQuality)
+            .putExtra(EXTRA_MESSAGE, message)
+        confidence?.let { intent.putExtra(EXTRA_CONFIDENCE, it) }
+        sendBroadcast(intent)
     }
 
     private inline fun <reified T : android.os.Parcelable> Intent.getParcelableExtraCompat(key: String): T? {

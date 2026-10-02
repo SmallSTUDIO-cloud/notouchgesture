@@ -25,7 +25,7 @@ object TransferProtocol {
         val parts = raw.split(SEP)
         return when (parts.firstOrNull()) {
             "OFFER" -> {
-                val size = parts.getOrNull(2)?.toLongOrNull() ?: return null
+                val size = parts.getOrNull(2)?.toLongOrNull()?.takeIf { it > 0L } ?: return null
                 parts.getOrNull(1)?.takeIf { it.isNotBlank() }?.let { TransferMessage.Offer(it, size) }
             }
             "ACCEPT" -> parts.getOrNull(1)?.takeIf { it.isNotBlank() }?.let(TransferMessage::Accept)
@@ -39,5 +39,5 @@ object TransferProtocol {
         }
     }
 
-    private fun sanitize(value: String): String = value.replace("|", "_").replace("\n", " ").trim()
+    private fun sanitize(value: String): String = value.replace("|", "_").replace("\n", " ").replace("\r", " ").trim().take(240)
 }
