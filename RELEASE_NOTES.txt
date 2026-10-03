@@ -1,0 +1,21 @@
+PalmLink 0.3.1
+
+Final correction pass applied to the 0.3.0 source.
+
+Implemented:
+- service-owned Nearby lifecycle with persistent desired role
+- connectedDevice FGS type promotion before Nearby use, including fallback recovery
+- deterministic background gestures: open palm -> fist captures/sends; fist -> open palm receives
+- cryptographic reconnect authentication with local shared secret/HMAC
+- screenshot transfer metadata, size/SHA-256/PNG verification and atomic save
+- persistent short-lived screenshot queue across service/process recreation
+- duplicate Nearby start protection and reconnect backoff
+- Activity lifecycle no longer stops Nearby
+- queued screenshots during an active transfer are persisted
+
+Verification:
+- Pure Kotlin logic/protocol/pairing smoke checks passed in the available environment.
+- Full Android build was not executed because this environment does not contain the Android SDK/Gradle distribution.
+
+Build in the configured Codespace with:
+./gradlew clean test assembleDebug --no-configuration-cache

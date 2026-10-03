@@ -21,6 +21,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- Nearby session owned by the service. Prerequisite for the connectedDevice type is
+         satisfied by CHANGE_WIFI_STATE above plus the BLUETOOTH_* runtime permissions. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Keeps the gesture engine and Nearby session running with the screen off. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="true"
@@ -43,7 +48,7 @@
         <service
             android:name=".capture.ScreenCaptureService"
             android:exported="false"
-            android:foregroundServiceType="camera|mediaProjection" />
+            android:foregroundServiceType="connectedDevice|camera|mediaProjection" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

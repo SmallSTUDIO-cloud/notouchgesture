@@ -107,6 +107,8 @@ class MainActivity : ComponentActivity() {
     private var themeState = mutableStateOf(ThemeMode.AUTO)
     private var backgroundState = mutableStateOf("PalmLink is not running in the background")
     private var backgroundRunningState = mutableStateOf(ScreenCaptureService.running)
+    private var captureReadyState = mutableStateOf(ScreenCaptureService.captureReady)
+    private var lastHandledReceived: File? = null
     private var backgroundGestureState = mutableStateOf(GestureRecognizerController.GestureUiState())
 
     private val captureProjectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -133,6 +135,7 @@ class MainActivity : ComponentActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             intent.getStringExtra(ScreenCaptureService.EXTRA_MESSAGE)?.let { backgroundState.value = it }
             backgroundRunningState.value = intent.getBooleanExtra(ScreenCaptureService.EXTRA_RUNNING, backgroundRunningState.value)
+            captureReadyState.value = intent.getBooleanExtra(ScreenCaptureService.EXTRA_CAPTURE_READY, captureReadyState.value)
         }
     }
 
@@ -140,8 +143,11 @@ class MainActivity : ComponentActivity() {
         runOnUiThread {
             nearbyState.value = state
             state.lastReceivedFile?.let { received ->
-                captureStore.saveLatest(received)
-                latestCaptureState.value = received
+                if (received != lastHandledReceived) {
+                    lastHandledReceived = received
+                    captureStore.saveLatest(received)
+                    latestCaptureState.value = received
+                }
             }
         }
     }
@@ -168,6 +174,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         captureStore = CaptureStore(this)
         nearby = NearbyRuntime.get(this)
+        // Activity recreation: start from the service's real state, not stale Activity state.
+        lastHandledReceived = nearby.currentState().lastReceivedFile
+        backgroundRunningState.value = ScreenCaptureService.running
+        captureReadyState.value = ScreenCaptureService.captureReady
+        if (ScreenCaptureService.running) backgroundState.value = "PalmLink is running in the background."
         nearby.addStateListener(nearbyStateListener)
         latestCaptureState.value = captureStore.latestFile()
         themeState.value = ThemeStore(this).get()
@@ -205,14 +216,16 @@ class MainActivity : ComponentActivity() {
                     onRequestNearby = ::requestNearbyPermissions,
                     onRequestCapture = ::requestScreenCapture,
                     backgroundRunning = backgroundRunningState.value,
+                    captureReady = captureReadyState.value,
                     backgroundState = backgroundState.value,
                     backgroundGestureState = backgroundGestureState.value,
-                    onStartAdvertising = { nearby.startAdvertising() },
-                    onStartDiscovery = { nearby.startDiscovery() },
+                    onStartAdvertising = { sendNearbyCommand(ScreenCaptureService.ACTION_NEARBY_ADVERTISE) },
+                    onStartDiscovery = { sendNearbyCommand(ScreenCaptureService.ACTION_NEARBY_DISCOVER) },
+                    onStopNearby = { sendNearbyCommand(ScreenCaptureService.ACTION_NEARBY_STOP) },
+                    onForgetPairing = { nearby.forgetTrustedPeers() },
                     onConfirmConnection = { nearby.confirmPendingConnection() },
                     onRejectConnection = { nearby.rejectPendingConnection() },
-                    onSendOffer = { file -> nearby.sendOffer(file) },
-                    onAcceptOffer = { nearby.acceptPendingOffer() },
+                    onSendOffer = { file -> nearby.sendScreenshot(file) },
                     onSaveGallery = { file -> MediaStoreSaver.saveToPictures(this, file) },
                     onDeleteCapture = { file ->
                         val deleted = file.delete()
@@ -228,10 +241,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // Re-sync with the service every time the UI becomes visible.
+        backgroundRunningState.value = ScreenCaptureService.running
+        captureReadyState.value = ScreenCaptureService.captureReady
+    }
+
     override fun onDestroy() {
-        if (!ScreenCaptureService.running) {
-            runCatching { nearby.stopAll() }
-        }
+        // The Nearby session belongs to ScreenCaptureService. The Activity only observes it, so
+        // finishing, recreating or swiping away the UI must NOT touch the connection.
         nearby.removeStateListener(nearbyStateListener)
         runCatching { unregisterReceiver(captureReceiver) }
         runCatching { unregisterReceiver(backgroundStateReceiver) }
@@ -239,11 +258,32 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    /**
+     * Starts/stops Nearby inside the foreground service. Going through the service (never calling
+     * the manager directly) guarantees the session lives in a process Android keeps alive.
+     */
+    private fun sendNearbyCommand(action: String) {
+        if (action != ScreenCaptureService.ACTION_NEARBY_STOP && !nearbyPermissionsGranted(this)) {
+            requestNearbyPermissions()
+            return
+        }
+        val intent = Intent(this, ScreenCaptureService::class.java).setAction(action)
+        runCatching {
+            if (action == ScreenCaptureService.ACTION_NEARBY_STOP) startService(intent)
+            else ContextCompat.startForegroundService(this, intent)
+        }.onFailure { error ->
+            backgroundState.value = "Could not start PalmLink Nearby: ${error.message ?: "Android rejected the request"}"
+        }
+    }
+
     fun requestScreenCapture() {
-        if (ScreenCaptureService.running) {
+        if (ScreenCaptureService.captureReady) {
             val intent = Intent(this, ScreenCaptureService::class.java)
                 .setAction(ScreenCaptureService.ACTION_CAPTURE_NOW)
-            runCatching { ContextCompat.startForegroundService(this, intent) }
+            // The service is already a foreground service here, so a plain startService() is
+            // enough. Using startForegroundService() would oblige the service to call
+            // startForeground() again and, if it could not, Android would kill the app.
+            runCatching { startService(intent) }
                 .onFailure { error ->
                     backgroundState.value = "Could not capture the screen: ${error.message ?: "Android rejected the request"}"
                 }
@@ -268,9 +308,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startCaptureService(resultCode: Int, data: Intent) {
-        if (ScreenCaptureService.running) {
+        if (ScreenCaptureService.captureReady) {
             ScreenCaptureService.finishStarting()
-            backgroundRunningState.value = true
+            backgroundRunningState.value = ScreenCaptureService.running
             backgroundState.value = "PalmLink is already running in the background."
             return
         }
@@ -279,27 +319,38 @@ class MainActivity : ComponentActivity() {
             requestCameraPermissions()
             return
         }
-        // Release the foreground CameraX/MediaPipe pipeline first. The controller invokes the
-        // callback only after the current inference has finished and the native recognizer has
-        // been closed, preventing an Activity→service camera race on OEM devices.
         val intent = Intent(this, ScreenCaptureService::class.java).apply {
             putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
             putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, data)
         }
-        backgroundRunningState.value = false
         backgroundState.value = "Starting PalmLink background mode…"
-        GestureRecognizerController.stopActive {
-            window.decorView.postDelayed({
-                if (isFinishing || (Build.VERSION.SDK_INT >= 17 && isDestroyed)) return@postDelayed
-                runCatching {
-                    ContextCompat.startForegroundService(this@MainActivity, intent)
-                }.onFailure { error ->
-                    ScreenCaptureService.finishStarting()
-                    backgroundRunningState.value = false
-                    backgroundState.value = "PalmLink could not start: ${error.message ?: "Android rejected the service start"}"
-                }
-            }, 150L)
+        if (ScreenCaptureService.running) {
+            // Only the projection ended; the service's camera engine is still up and is re-used.
+            // Stopping the "active" controller here would stop that engine.
+            launchCaptureService(intent)
+        } else {
+            backgroundRunningState.value = false
+            // Release the foreground CameraX/MediaPipe pipeline first. The controller invokes the
+            // callback only after the current inference has finished and the native recognizer has
+            // been closed, preventing an Activity→service camera race on OEM devices.
+            GestureRecognizerController.stopActive { launchCaptureService(intent) }
         }
+    }
+
+    private fun launchCaptureService(intent: Intent) {
+        window.decorView.postDelayed({
+            if (isFinishing || (Build.VERSION.SDK_INT >= 17 && isDestroyed)) {
+                ScreenCaptureService.finishStarting()
+                return@postDelayed
+            }
+            runCatching {
+                ContextCompat.startForegroundService(this@MainActivity, intent)
+            }.onFailure { error ->
+                ScreenCaptureService.finishStarting()
+                backgroundRunningState.value = ScreenCaptureService.running
+                backgroundState.value = "PalmLink could not start: ${error.message ?: "Android rejected the service start"}"
+            }
+        }, 150L)
     }
 
     private fun requestCameraPermissions() {
@@ -321,7 +372,10 @@ class MainActivity : ComponentActivity() {
             } else {
                 add(Manifest.permission.ACCESS_COARSE_LOCATION)
             }
-            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            if (Build.VERSION.SDK_INT >= 33) {
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
+                add(Manifest.permission.POST_NOTIFICATIONS) // shows the PalmLink status notification
+            }
         }
         permissionsLauncher.launch(permissions.toTypedArray())
     }
@@ -355,14 +409,16 @@ private fun NoTouchApp(
     onRequestNearby: () -> Unit,
     onRequestCapture: () -> Unit,
     backgroundRunning: Boolean,
+    captureReady: Boolean,
     backgroundState: String,
     backgroundGestureState: GestureRecognizerController.GestureUiState,
     onStartAdvertising: () -> Unit,
     onStartDiscovery: () -> Unit,
+    onStopNearby: () -> Unit,
+    onForgetPairing: () -> Unit,
     onConfirmConnection: () -> Unit,
     onRejectConnection: () -> Unit,
     onSendOffer: (File) -> Unit,
-    onAcceptOffer: () -> Unit,
     onSaveGallery: (File) -> Boolean,
     onDeleteCapture: (File) -> Boolean,
     onShare: (File) -> Unit,
@@ -424,6 +480,7 @@ private fun NoTouchApp(
                 onRequestCamera = onRequestCamera,
                 onRequestCapture = onRequestCapture,
                 backgroundRunning = backgroundRunning,
+                captureReady = captureReady,
                 backgroundState = backgroundState,
                 backgroundGestureState = backgroundGestureState,
             )
@@ -435,10 +492,12 @@ private fun NoTouchApp(
                 onRequestCamera = onRequestCamera,
                 onStartAdvertising = onStartAdvertising,
                 onStartDiscovery = onStartDiscovery,
+                onStopNearby = onStopNearby,
+                onForgetPairing = onForgetPairing,
                 onConfirmConnection = onConfirmConnection,
                 onRejectConnection = onRejectConnection,
                 onSendOffer = onSendOffer,
-                onAcceptOffer = onAcceptOffer,
+                backgroundRunning = backgroundRunning,
             )
         }
     }
@@ -484,7 +543,7 @@ private fun HomeScreen(
                     Text("Control your screen without touching it.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "Open palm → fist triggers the capture flow. Fist → open palm creates a nearby screenshot offer.",
+                        "Open palm → fist captures your screen and sends it to your paired phone. Fist → open palm receives an incoming screenshot.",
                         style = MaterialTheme.typography.bodyLarge,
                     )
                     Spacer(Modifier.height(18.dp))
@@ -580,6 +639,7 @@ private fun GestureScreen(
     onRequestCamera: () -> Unit,
     onRequestCapture: () -> Unit,
     backgroundRunning: Boolean,
+    captureReady: Boolean,
     backgroundState: String,
     backgroundGestureState: GestureRecognizerController.GestureUiState,
 ) {
@@ -619,9 +679,19 @@ private fun GestureScreen(
                 } else {
                     StatusChip("RUNNING IN BACKGROUND")
                     Spacer(Modifier.height(8.dp))
-                    Text("Open palm → fist captures the current screen. A persistent notification provides the stop control.")
+                    Text("Open palm → fist captures the current screen and sends it to the connected device. Fist → open palm receives an incoming screenshot. A persistent notification provides the stop control.")
                     Spacer(Modifier.height(8.dp))
                     Text("${backgroundGestureState.message}")
+                    if (!captureReady) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Screen capture has ended (for example the screen was locked). Receiving still works; re-enable screen capture to take screenshots.")
+                        Spacer(Modifier.height(8.dp))
+                        Button(onClick = onRequestCapture) {
+                            Icon(Icons.Filled.ScreenShare, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Re-enable screen capture")
+                        }
+                    }
                 }
             }
         }
@@ -720,10 +790,12 @@ private fun NearbyScreen(
     onRequestCamera: () -> Unit,
     onStartAdvertising: () -> Unit,
     onStartDiscovery: () -> Unit,
+    onStopNearby: () -> Unit,
+    onForgetPairing: () -> Unit,
     onConfirmConnection: () -> Unit,
     onRejectConnection: () -> Unit,
     onSendOffer: (File) -> Unit,
-    onAcceptOffer: () -> Unit,
+    backgroundRunning: Boolean,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -741,7 +813,7 @@ private fun NearbyScreen(
 
     Column(modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("Nearby", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text("Pair locally, offer a screenshot, then accept it with a gesture. No cloud account required.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("Pair once, then use gestures only: open palm → fist captures and sends; fist → open palm receives. No cloud account required.", color = MaterialTheme.colorScheme.onSurfaceVariant)
 
         if (!hasNearby) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
@@ -779,6 +851,12 @@ private fun NearbyScreen(
                     Button(onClick = onStartAdvertising, enabled = hasNearby) { Text("Make visible") }
                     TextButton(onClick = onStartDiscovery, enabled = hasNearby) { Text("Find devices") }
                 }
+                if (state.connected || state.advertising || state.discovering) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = onStopNearby) { Text("Stop Nearby") }
+                        TextButton(onClick = onForgetPairing) { Text("Forget pairing") }
+                    }
+                }
             }
         }
 
@@ -787,12 +865,12 @@ private fun NearbyScreen(
                 Column(Modifier.padding(20.dp)) {
                     Text("Send", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(6.dp))
-                    Text("On the sender: hold a closed fist, then open your palm. This creates a transfer offer. The receiver then opens their palm to accept.")
+                    Text("Open palm → fist captures the screen and sends it automatically. If a send was missed, you can offer the latest capture again here.")
                     Spacer(Modifier.height(12.dp))
                     Button(onClick = { onSendOffer(latestCapture) }, enabled = state.connected) {
                         Icon(Icons.Filled.Send, null)
                         Spacer(Modifier.width(8.dp))
-                        Text("Send latest capture")
+                        Text("Send latest capture again")
                     }
                 }
             }
@@ -805,19 +883,15 @@ private fun NearbyScreen(
                     Text("Screenshot waiting", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                     Text("${offer.fileName} • ${offer.byteCount / 1024} KB")
                     Spacer(Modifier.height(8.dp))
-                    Text("Receiver gesture: open your palm to accept this transfer.")
-                    Spacer(Modifier.height(12.dp))
-                    Button(onClick = onAcceptOffer, enabled = state.connected) { Text("Accept now") }
+                    Text("Make a fist, then open your palm to receive this screenshot. No tap needed.")
                 }
             }
         }
 
         NearbyGesturePanel(
             state = state,
-            latestCapture = latestCapture,
+            backgroundRunning = backgroundRunning,
             onRequestCamera = onRequestCamera,
-            onSendOffer = onSendOffer,
-            onAcceptOffer = onAcceptOffer,
         )
 
         TransferProgress(state.progress)
@@ -836,19 +910,16 @@ private fun NearbyScreen(
 @Composable
 private fun NearbyGesturePanel(
     state: NearbyTransferManager.State,
-    latestCapture: File?,
+    backgroundRunning: Boolean,
     onRequestCamera: () -> Unit,
-    onSendOffer: (File) -> Unit,
-    onAcceptOffer: () -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val hasCameraPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-    val mode = when {
-        state.pendingOffer != null -> GestureStateMachine.GestureMode.RECEIVE
-        state.connected && latestCapture != null -> GestureStateMachine.GestureMode.SEND
-        else -> null
-    }
+    // While the background service runs, ITS camera engine handles every gesture. A second
+    // foreground controller would take over the camera (only one controller may be active) and
+    // double-handle gestures, so the panel is hidden in that case.
+    val mode = if (state.connected && !backgroundRunning) GestureStateMachine.GestureMode.RECEIVE else null
     var previewView by remember(mode) { mutableStateOf<PreviewView?>(null) }
     var gestureState by remember(mode) { mutableStateOf(GestureRecognizerController.GestureUiState()) }
     var lastGestureMessage by remember(mode) { mutableStateOf("") }
@@ -857,17 +928,12 @@ private fun NearbyGesturePanel(
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
             Column(Modifier.padding(20.dp)) {
                 Text(
-                    if (mode == GestureStateMachine.GestureMode.SEND) "Gesture send" else "Gesture receive",
+                    "Gesture receive",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Spacer(Modifier.height(6.dp))
-                Text(
-                    if (mode == GestureStateMachine.GestureMode.SEND)
-                        "Hold a closed fist, then open your palm to offer the latest screenshot."
-                    else
-                        "Open your palm steadily to accept the pending screenshot."
-                )
+                Text("Make a fist, then open your palm to receive the incoming screenshot. Enable PalmLink on the Gesture tab to do this from other apps.")
                 Spacer(Modifier.height(12.dp))
 
                 if (!hasCameraPermission) {
@@ -919,15 +985,9 @@ private fun NearbyGesturePanel(
                 onState = { gestureState = it },
                 onAction = { action ->
                     when (action) {
-                        GestureStateMachine.Action.SEND_OFFER -> {
-                            latestCapture?.let { file ->
-                                lastGestureMessage = "Gesture recognized. Sending offer…"
-                                onSendOffer(file)
-                            }
-                        }
                         GestureStateMachine.Action.RECEIVE_ACCEPT -> {
-                            lastGestureMessage = "Gesture recognized. Accepting screenshot…"
-                            onAcceptOffer()
+                            lastGestureMessage = "Gesture recognized. Receiving screenshot…"
+                            NearbyRuntime.get(context).authorizeReceive()
                         }
                         GestureStateMachine.Action.ARMED -> lastGestureMessage = "Sequence armed. Complete the gesture."
                         else -> Unit

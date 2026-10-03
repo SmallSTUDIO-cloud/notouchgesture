@@ -4,8 +4,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.SystemClock
+import android.util.Log
 import android.util.Size
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.CameraState
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
@@ -13,6 +16,8 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.Observer
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.google.mediapipe.tasks.components.processors.ClassifierOptions
@@ -62,7 +67,12 @@ class GestureRecognizerController(
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
     private var previewUseCase: Preview? = null
+    private var cameraStateData: LiveData<CameraState>? = null
+    private var cameraStateObserver: Observer<CameraState>? = null
     private var started = false
+
+    /** True between a successful start() and stop(); lets owners detect a controller that died. */
+    val isRunning: Boolean get() = started
 
     fun start() {
         synchronized(REGISTRY_LOCK) {
@@ -75,10 +85,13 @@ class GestureRecognizerController(
 
         try {
             setupRecognizer()
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
+            // Includes LinkageError (e.g. a native MediaPipe library that failed to load).
+            if (error is VirtualMachineError) throw error
+            Log.e(TAG, "MediaPipe recognizer setup failed", error)
             val message = "Gesture engine could not start: ${error.message ?: "model error"}"
             publish(GestureUiState(message = message))
-            mainExecutor.execute { onFatalError(message) }
+            mainExecutor.execute { safely { onFatalError(message) } }
             stop()
             return
         }
@@ -91,10 +104,12 @@ class GestureRecognizerController(
                 bindCamera(cameraProvider!!)
                 publish(GestureUiState(message = "Camera ready. Show one hand clearly in the frame."))
                 onReady()
-            } catch (error: Exception) {
-                val message = "Camera could not start: ${error.message ?: "unknown error"}"
+            } catch (error: Throwable) {
+                if (error is VirtualMachineError) throw error
+                Log.e(TAG, "CameraX could not start", error)
+                val message = "Camera could not start: ${error.message ?: error.javaClass.simpleName}"
                 publish(GestureUiState(message = message))
-                onFatalError(message)
+                safely { onFatalError(message) }
                 stop()
             }
         }, mainExecutor)
@@ -117,6 +132,7 @@ class GestureRecognizerController(
         started = false
         acceptingFrames.set(false)
 
+        removeCameraStateObserver()
         val provider = cameraProvider
         if (unbindCamera) {
             runCatching {
@@ -208,7 +224,49 @@ class GestureRecognizerController(
         } else {
             arrayOf<androidx.camera.core.UseCase>(analysis)
         }
-        provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_FRONT_CAMERA, *useCases)
+        val camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_FRONT_CAMERA, *useCases)
+        observeCameraState(camera)
+    }
+
+    /**
+     * Camera failures that happen after bindToLifecycle() returns (camera disabled by policy,
+     * in use by another app, fatal HAL error, ...) are reported asynchronously by CameraX.
+     * Surface them instead of silently running without a camera.
+     */
+    private fun observeCameraState(camera: Camera) {
+        removeCameraStateObserver()
+        val liveData = camera.cameraInfo.cameraState
+        val observer = Observer<CameraState> { cameraState ->
+            val error = cameraState.error
+            if (error != null && started) {
+                val critical = error.code == CAMERA_ERROR_STREAM_CONFIG ||
+                    error.code == CAMERA_ERROR_DISABLED ||
+                    error.code == CAMERA_ERROR_FATAL
+                Log.w(TAG, "Camera state error code=${error.code} critical=$critical")
+                if (critical) {
+                    val message = "Camera error (code ${error.code}). Check that no other app is blocking the camera."
+                    publish(GestureUiState(message = message))
+                    safely { onFatalError(message) }
+                    stop()
+                } else {
+                    publish(GestureUiState(message = "Camera is busy or temporarily unavailable. Retrying…"))
+                }
+            }
+        }
+        cameraStateData = liveData
+        cameraStateObserver = observer
+        liveData.observe(lifecycleOwner, observer)
+    }
+
+    private fun removeCameraStateObserver() {
+        val data = cameraStateData
+        val observer = cameraStateObserver
+        cameraStateData = null
+        cameraStateObserver = null
+        if (data != null && observer != null) {
+            // LiveData observers must be removed on the main thread.
+            mainExecutor.execute { runCatching { data.removeObserver(observer) } }
+        }
     }
 
     private fun analyze(image: ImageProxy) {
@@ -324,7 +382,7 @@ class GestureRecognizerController(
             }
             label == GestureStateMachine.Label.CLOSED_FIST && confidence != null && confidence >= 0.45f -> when (mode) {
                 GestureStateMachine.GestureMode.CAPTURE -> "Closed fist detected."
-                GestureStateMachine.GestureMode.BACKGROUND -> "Closed fist detected. Open your hand to send."
+                GestureStateMachine.GestureMode.BACKGROUND -> "Closed fist detected. Open your hand to receive."
                 GestureStateMachine.GestureMode.SEND -> "Closed fist detected. Open your hand to send."
                 GestureStateMachine.GestureMode.RECEIVE -> "Closed fist detected."
             }
@@ -334,7 +392,7 @@ class GestureRecognizerController(
 
         publishThrottled(GestureUiState(label, confidence?.coerceIn(0f, 1f), handQuality, message), now)
         if (action != GestureStateMachine.Action.NONE) {
-            mainExecutor.execute { onAction(action) }
+            mainExecutor.execute { safely { onAction(action) } }
         }
     }
 
@@ -397,7 +455,16 @@ class GestureRecognizerController(
     }
 
     private fun publish(state: GestureUiState) {
-        mainExecutor.execute { onState(state) }
+        mainExecutor.execute { safely { onState(state) } }
+    }
+
+    /** Callbacks run on the main thread; an exception in one must never take the process down. */
+    private inline fun safely(block: () -> Unit) {
+        try {
+            block()
+        } catch (error: Exception) {
+            Log.e(TAG, "Gesture callback failed", error)
+        }
     }
 
     private fun publishThrottled(state: GestureUiState, now: Long) {
@@ -420,7 +487,13 @@ class GestureRecognizerController(
             }
         }
 
+        private const val TAG = "PalmLink"
         private const val MODEL_ASSET = "gesture_recognizer.task"
+
+        // CameraState.StateError codes (androidx.camera.core.CameraState.ERROR_*).
+        private const val CAMERA_ERROR_STREAM_CONFIG = 4
+        private const val CAMERA_ERROR_DISABLED = 5
+        private const val CAMERA_ERROR_FATAL = 6
         private val REGISTRY_LOCK = Any()
         private var activeController: GestureRecognizerController? = null
     }

@@ -1,6 +1,0 @@
-<resources>
-    <string name="app_name">PalmLink</string>
-    <string name="capture_channel_name">Screen capture</string>
-    <string name="capture_notification_title">PalmLink is running in the background</string>
-    <string name="file_provider_authority">com.samin.notouchgesture.files</string>
-</resources>
