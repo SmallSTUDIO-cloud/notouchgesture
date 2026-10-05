@@ -1,0 +1,30 @@
+PalmLink 0.4.0
+
+Visual transfer and automatic gallery-save upgrade built on the known-good 0.3.1 core. Existing gesture, Nearby, pairing, MediaProjection and background architecture is preserved.
+
+Implemented:
+- Automatic save of captured and received screenshots to Pictures/PalmLink via MediaStore on modern Android.
+- Duplicate-safe gallery saving; manual Save again remains available.
+- Full-screen screenshot shutter flash followed by a thin animated PalmLink-blue edge glow for about 3 seconds.
+- Capture status overlay with automatic Gallery-save status.
+- Camera-style shutter sound using Android MediaActionSound, with an in-app ON/OFF setting.
+- System-overlay visual feedback for background capture/send/receive activity.
+- PalmLink logo and the actual screenshot thumbnail orbit during sending and receiving.
+- Smooth receiving completion window with blue glow, received screenshot preview and Gallery confirmation.
+- Transfer preview is sent only after the receiver accepts the screenshot, while older builds can still complete the original transfer flow.
+- Additional bitmap lifecycle cleanup and UI text updated for automatic Gallery saving.
+- App icon remains unchanged.
+
+Verification performed in the available inspection environment:
+- Pure Kotlin gesture, transfer protocol, preview message and pairing checks passed.
+- Source-level audit of changed Android files completed.
+- Changed-file diff against the 0.3.1 source reviewed; only the intended 0.4.0 files/assets differ.
+- Full Android Gradle build and device validation could not be executed in this container because the Android SDK and Gradle distribution are not installed locally and external downloads are unavailable.
+
+Codespace build command:
+./gradlew clean test assembleDebug --no-configuration-cache
+
+0.4.0 gesture tracking refinement
+- Gesture steps use a short stable window for fast natural motions, with brief confidence-dropout tolerance.
+- MediaPipe runs synchronously in VIDEO mode so sequential camera frames retain temporal tracking.
+- Capture remains open-palm -> closed-fist. Receive authorization remains closed-fist -> open-palm.
