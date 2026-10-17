@@ -1,59 +1,28 @@
-# No Touch Gesture roadmap
+# Aerviqo roadmap
 
-## Product goal
+## Included in 0.5.0
 
-Make nearby screenshot capture and sharing feel like a deliberate physical interaction rather than a collection of permissions and gestures.
+- Aerviqo branding and supplied logo.
+- Persistent background gesture engine retained from the working baseline.
+- Automatic Gallery saving.
+- Shutter sound and visual feedback.
+- Transfer/receive preview feedback.
+- Faster temporal gesture tracking.
+- Settings and gesture manual.
+- Optional air controls: scroll, swipe, volume, brightness, cursor/select, zoom, Back/Home and media commands.
+- Shake flashlight.
+- Foreground-only experimental mouth-open Air Mic.
+- Nearby 8003/8009 recovery handling.
 
-## Release 0.1: proof of concept
+## Final validation still required
 
-Delivered in this source tree:
-
-- Android Compose UI with Auto / Light / Dark appearance.
-- CameraX front-camera preview.
-- MediaPipe live-stream gesture recognition.
-- Stable palm/fist gesture state machine.
-- One-hand and framing quality gate.
-- Open palm → closed fist capture trigger.
-- Closed fist → open palm send trigger.
-- Open palm receiver acceptance.
-- MediaProjection capture service.
-- Nearby Connections discovery, connection, offer, accept and file payload transfer.
-- Local capture storage.
-- Gallery export and Android share sheet.
-- User-facing privacy and Android security notes.
-
-## Release 0.2: reliability
-
-1. Add CameraX/MediaPipe instrumentation tests on at least three physical device families.
-2. Track gesture false positives and missed detections across lighting, distance, skin tone, background clutter, glasses/reflections, and camera quality.
-3. Tune thresholds per device performance profile.
-4. Add lifecycle recovery after app backgrounding, camera interruptions, incoming calls, and display rotation.
-5. Add persistent transfer jobs, progress recovery and retry.
-6. Add a real receive inbox/history instead of a single latest item.
-7. Add explicit connection trust records so repeated transfers do not silently trust a new endpoint.
-
-## Release 0.3: product differentiation
-
-1. QR fallback for pairing when Nearby discovery is blocked.
-2. Device nickname and verified-device list.
-3. One-tap quick action for recently paired devices.
-4. Animated gesture guidance that explains timing without covering the camera.
-5. Accessibility-conscious alternatives: physical shortcut, notification action and Quick Settings tile.
-6. Better transfer diagnostics and a privacy audit screen.
-
-## Global screenshot strategy
-
-A normal Android app cannot silently capture another app's screen just because it is looking through the camera. MediaProjection requires OS-mediated user consent, and Android 14+ adds stricter consent/session behavior.
-
-Do not solve this by quietly abusing AccessibilityService. The production architecture should instead investigate a justified OS-level integration, launcher/device-owner scenario, OEM API, Quick Settings workflow, or another platform-approved mechanism. The correct solution depends on the intended distribution channel and Android version range.
-
-## Release 1.0 gates
-
-- Gesture action precision/recall measured on a real device test set.
-- No screenshot or transfer starts from a single noisy frame.
-- Every transfer has an explicit, understandable trust boundary.
-- All stored screenshots can be deleted and exported.
-- Failed transfers never surface incomplete images as successful results.
-- Privacy text matches the actual implementation.
-- Android 14+ behavior verified on physical hardware.
-- Release build is signed and reproducible in CI.
+- Android build and unit tests in the configured Codespace.
+- Two-phone capture/send/receive test.
+- Background operation after leaving Aerviqo.
+- Samsung/OEM camera and foreground-service behavior.
+- MediaProjection revocation/recovery.
+- Nearby interruption/reconnection and large-file transfer.
+- Gallery publication and duplicate prevention.
+- Visual feedback and shutter sound settings.
+- AccessibilityService controls and overlay permission behavior.
+- Flashlight debounce and Air Mic behavior on the target Android version.

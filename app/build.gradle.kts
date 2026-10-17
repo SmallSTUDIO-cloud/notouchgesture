@@ -7,25 +7,33 @@ plugins {
 }
 
 val gestureModelUrl = "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
-val gestureModelFile = file("src/main/assets/gesture_recognizer.task")
+val gestureModelFile = layout.projectDirectory.file("src/main/assets/gesture_recognizer.task")
 
 tasks.register("downloadGestureModel") {
-    outputs.file(gestureModelFile)
+    notCompatibleWithConfigurationCache("Task interacts directly with script/network")
+    val outputFile = gestureModelFile.asFile
+    outputs.file(outputFile)
     doLast {
-        if (gestureModelFile.exists() && gestureModelFile.length() > 1_000_000L) return@doLast
-        gestureModelFile.parentFile.mkdirs()
+        if (outputFile.exists() && outputFile.length() > 1_000_000L) return@doLast
+        outputFile.parentFile.mkdirs()
         val connection = URL(gestureModelUrl).openConnection() as HttpURLConnection
         connection.connectTimeout = 30_000
         connection.readTimeout = 120_000
         connection.requestMethod = "GET"
-        connection.connect()
-        if (connection.responseCode !in 200..299) {
-            error("Could not download MediaPipe gesture model: HTTP ${connection.responseCode}")
+        try {
+            connection.connect()
+            if (connection.responseCode !in 200..299) {
+                error("Could not download MediaPipe gesture model: HTTP ${connection.responseCode}")
+            }
+            connection.inputStream.use { input ->
+                outputFile.outputStream().use { output -> input.copyTo(output) }
+            }
+        } finally {
+            connection.disconnect()
         }
-        connection.inputStream.use { input ->
-            gestureModelFile.outputStream().use { output -> input.copyTo(output) }
+        require(outputFile.exists() && outputFile.length() > 1_000_000L) {
+            "MediaPipe gesture model was not downloaded correctly"
         }
-        connection.disconnect()
     }
 }
 
@@ -39,8 +47,8 @@ android {
         applicationId = "com.samin.notouchgesture"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 5
+        versionName = "0.5.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -57,12 +65,12 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
 
     kotlin {
-        jvmToolchain(17)
+        jvmToolchain(21)
     }
 
     buildFeatures {
@@ -73,6 +81,10 @@ android {
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -80,6 +92,8 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
+    implementation("androidx.lifecycle:lifecycle-service:2.11.0")
+    implementation("androidx.fragment:fragment:1.3.0")
 
     implementation(platform("androidx.compose:compose-bom:2026.09.00"))
     implementation("androidx.compose.ui:ui")
@@ -94,6 +108,7 @@ dependencies {
     implementation("androidx.camera:camera-view:1.6.2")
 
     implementation("com.google.mediapipe:tasks-vision:1.0.0")
+    implementation("com.google.mlkit:face-detection:16.1.7")
     implementation("com.google.android.gms:play-services-nearby:19.5.0")
 
     testImplementation("junit:junit:4.13.2")

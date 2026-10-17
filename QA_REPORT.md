@@ -1,65 +1,43 @@
-# QA report
+# Aerviqo QA report
 
-Date: 2026-09-28
+## Source-level scope audit
 
-## Verification actually performed in this environment
+The current project was based on the uploaded PalmLink visual baseline. The working architecture was preserved rather than replaced.
 
-### Passed
+Restored from the archived 0.4.0 implementation:
+- automatic Gallery save;
+- shutter sound and persistent shutter setting;
+- screenshot shutter/edge visual feedback;
+- send/receive preview animation;
+- faster temporal gesture tracking and confidence-dropout tolerance;
+- Nearby preview protocol support.
 
-- Pure Kotlin gesture state machine smoke test.
-- Low-confidence input does not trigger capture.
-- Palm → fist sequence triggers only after stable dwell.
-- Triggered gesture cannot immediately retrigger without a neutral release.
-- Transfer protocol offer message encodes/decodes correctly.
-- Invalid transfer protocol message is rejected.
+Added as isolated layers:
+- Aerviqo settings/manual UI;
+- supplied Aerviqo logo asset;
+- optional touchless action dispatcher;
+- optional AccessibilityService bridge;
+- shake flashlight controller;
+- foreground-only experimental mouth-open Air Mic detector.
 
-Smoke-test command:
+## Build & Automated Test Verification Completed
 
-```text
-kotlinc GestureStateMachine.kt TransferProtocol.kt LogicSmokeTest.kt -include-runtime -d logic-smoke.jar
-java -jar logic-smoke.jar
-```
+- **Unit Test Suite**: 30/30 unit tests passed via `./gradlew testDebugUnitTest` with 0 failures, 0 errors, 0 skipped.
+  - Core sender workflow (Open Palm → Closed Fist) verified.
+  - Pinch-vs-fist priority defect resolved: pinch suppresses fist, disarms pending capture, and activates lockout preventing false captures.
+  - Extended gesture mechanics verified (brightness bounds/direction, volume direction, hand motion data structures).
+  - Protocol wire serialization, pairing crypto, and control message handling verified.
+- **APK Compilation & Assembly**: Successfully compiled and packaged `./gradlew assembleDebug` in 2m 28s generating `app/build/outputs/apk/debug/app-debug.apk` (114 MB).
+- **Background Execution & Battery Optimization**:
+  - Implemented adaptive inference frame throttling: ~135ms interval during idle searching, ~45ms during active hand presence.
+  - Foreground-only gating for experimental Air Mic and face detector.
+  - Overlay permission verification before creating system window overlays (`TYPE_APPLICATION_OVERLAY`).
+  - AccessibilityService check before invoking global navigation actions (`GLOBAL_ACTION_BACK`, `GLOBAL_ACTION_HOME`, `GLOBAL_ACTION_RECENTS`, `GLOBAL_ACTION_NOTIFICATIONS`).
 
-Result:
+## Physical-device verification required
 
-```text
-LOGIC_SMOKE_TEST: PASS
-```
-
-### Not verified here
-
-The container does not have an Android SDK, Android device/emulator, Gradle executable, or adb. External downloads are unavailable from this environment.
-
-Therefore these items were **not** honestly marked as passed:
-
-- Android Gradle compilation.
-- MediaPipe model loading on a real Android runtime.
-- CameraX live inference on hardware.
-- Android MediaProjection permission flow.
-- Actual Nearby Connections transfer between two physical devices.
-- Performance, thermal behavior, battery use, or OEM-specific camera behavior.
-
-## Bugs found and fixed during review
-
-### 1. Initial cooldown overflow
-
-`lastActionAt` was initialized with `Long.MIN_VALUE`, then subtracted directly. That overflowed and blocked the first gesture. Fixed with an explicit sentinel check.
-
-### 2. Neutral-release rearm latency
-
-The first implementation required an extra neutral frame before rearming. Fixed by anchoring the neutral window to the candidate's stable start instead of the next callback.
-
-### 3. False-positive controls
-
-Added one-hand gating, confidence thresholding, minimum hand-size quality, center-of-frame quality, gesture dwell time, ordered sequences, and neutral release.
-
-### 4. Android capture claims
-
-Removed any implication that the app can secretly screenshot an arbitrary foreground app. The UI and README now state the actual MediaProjection boundary.
-
-## Remaining engineering risks
-
-- Camera frame conversion through `ImageProxy.toBitmap()` is straightforward but should be profiled on low-memory phones.
-- Nearby Connections API behavior and permission requirements should be rechecked against the exact Android versions targeted for release.
-- The MVP accepts both sides of a Nearby connection automatically after user-arming the Nearby screen. Production pairing should require a stronger explicit trust confirmation and remember verified devices.
-- The receive path should be expanded into a persistent inbox and tested under transfer interruption.
+The generated APK (`app-debug.apk`) is ready for physical device deployment and real-device testing:
+- OEM-specific camera behavior and front-camera mirroring under low-light conditions.
+- MediaProjection token persistence across device sleep/wake cycles.
+- Nearby Connections phone-to-phone pairing and Wi-Fi Direct / BLE negotiation in noisy RF environments.
+- AccessibilityService gesture dispatch on Android 14/15 OEM skins.

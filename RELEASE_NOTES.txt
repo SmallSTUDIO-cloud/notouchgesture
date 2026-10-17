@@ -1,0 +1,19 @@
+Aerviqo 0.5.0
+
+Aerviqo is the renamed and extended PalmLink visual build. The original screenshot/transfer architecture remains the baseline.
+
+Included:
+- supplied Aerviqo logo artwork without redesign;
+- automatic Gallery save to Pictures/Aerviqo;
+- shutter sound ON/OFF;
+- screenshot shutter and blue-edge visual feedback;
+- send/receive preview animation;
+- faster temporal hand tracking and confidence-dropout tolerance;
+- separate Settings place;
+- illustrated in-app gesture manual;
+- optional scroll, swipe, volume, brightness, cursor/select, zoom, Back/Home and media controls;
+- optional shake flashlight;
+- experimental foreground mouth-open Air Mic;
+- Nearby recovery for already-connected (8003) and out-of-order (8009) races.
+
+The final Android build and physical-device validation must be performed in the configured Codespace/Freebuff environment.
