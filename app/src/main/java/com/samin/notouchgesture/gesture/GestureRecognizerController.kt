@@ -2,7 +2,6 @@ package com.samin.notouchgesture.gesture
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.os.SystemClock
 import android.util.Log
 import android.util.Size
@@ -22,6 +21,7 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.google.mediapipe.tasks.components.processors.ClassifierOptions
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
 import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizerResult
@@ -47,6 +47,8 @@ class GestureRecognizerController(
     private val receivePending: () -> Boolean = { false },
     private val onReady: () -> Unit = {},
     private val onFatalError: (String) -> Unit = {},
+    private val onMotion: (HandMotion) -> Unit = {},
+    private val onMouthOpen: (() -> Unit)? = null,
 ) {
     data class GestureUiState(
         val label: GestureStateMachine.Label = GestureStateMachine.Label.NONE,
@@ -55,9 +57,18 @@ class GestureRecognizerController(
         val message: String = "Searching for one hand…",
     )
 
+    data class HandMotion(
+        val centerX: Float,
+        val centerY: Float,
+        val deltaX: Float,
+        val deltaY: Float,
+        val pinchRatio: Float,
+        val timestampMs: Long,
+    )
+
     private val mainExecutor = ContextCompat.getMainExecutor(context)
     private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "PalmLink-Gesture").apply { priority = Thread.NORM_PRIORITY - 1 }
+        Thread(runnable, "PalmLink-Gesture").apply { priority = Thread.NORM_PRIORITY }
     }
     private val stateMachine = GestureStateMachine(mode)
     private val acceptingFrames = AtomicBoolean(false)
@@ -70,6 +81,11 @@ class GestureRecognizerController(
     private var cameraStateData: LiveData<CameraState>? = null
     private var cameraStateObserver: Observer<CameraState>? = null
     private var started = false
+    private var previousCenterX = Float.NaN
+    private var previousCenterY = Float.NaN
+    private var mouthDetector: MouthOpenDetector? = null
+    private var mouthFrameCounter = 0
+    private var lastMotionDispatchAt = Long.MIN_VALUE
 
     /** True between a successful start() and stop(); lets owners detect a controller that died. */
     val isRunning: Boolean get() = started
@@ -84,6 +100,7 @@ class GestureRecognizerController(
         }
 
         try {
+            if (onMouthOpen != null) mouthDetector = MouthOpenDetector { mainExecutor.execute { safely { onMouthOpen() } } }
             setupRecognizer()
         } catch (error: Throwable) {
             // Includes LinkageError (e.g. a native MediaPipe library that failed to load).
@@ -146,7 +163,7 @@ class GestureRecognizerController(
         previewUseCase = null
 
         // Never close MediaPipe while an ImageAnalysis callback may still be inside
-        // recognize(). Let the single analysis thread finish the current frame first, then
+        // recognition. Let the single analysis thread finish the current frame first, then
         // close the native recognizer. This is especially important when the foreground UI
         // hands camera ownership to the background service.
         val recognizerToClose = recognizer
@@ -158,7 +175,7 @@ class GestureRecognizerController(
             }
             runCatching {
                 // The executor is single-threaded, so this close runs only after any
-                // in-flight recognize() call and any already-queued analyzer callback.
+                // in-flight recognition call and any already-queued analyzer callback.
                 analysisExecutor.execute(closeTask)
             }.onFailure {
                 runCatching { recognizerToClose.close() }
@@ -169,6 +186,12 @@ class GestureRecognizerController(
         }
         analysisExecutor.shutdown()
         stateMachine.reset()
+        previousCenterX = Float.NaN
+        previousCenterY = Float.NaN
+        runCatching { mouthDetector?.close() }
+        mouthDetector = null
+        mouthFrameCounter = 0
+        lastMotionDispatchAt = Long.MIN_VALUE
     }
 
     private fun setupRecognizer() {
@@ -192,10 +215,9 @@ class GestureRecognizerController(
             .setMinTrackingConfidence(0.35f)
             .setMinHandPresenceConfidence(0.35f)
             .setCannedGesturesClassifierOptions(gestureClasses)
-            // IMAGE mode is intentionally used here. Inference is synchronous on the
-            // single analysis executor, which avoids keeping a recycled Bitmap alive while
-            // LIVE_STREAM inference is still pending and eliminates stale async callbacks.
-            .setRunningMode(RunningMode.IMAGE)
+            // VIDEO mode keeps MediaPipe's temporal tracking active across sequential camera
+            // frames while inference remains synchronous on the single analysis executor.
+            .setRunningMode(RunningMode.VIDEO)
             .build()
 
         recognizer = GestureRecognizer.createFromOptions(context, options)
@@ -269,6 +291,8 @@ class GestureRecognizerController(
         }
     }
 
+    private var lastVideoTimestampMs = Long.MIN_VALUE
+
     private fun analyze(image: ImageProxy) {
         if (!acceptingFrames.get()) {
             image.close()
@@ -276,13 +300,26 @@ class GestureRecognizerController(
         }
 
         var sourceBitmap: Bitmap? = null
-        var rotatedBitmap: Bitmap? = null
         try {
             sourceBitmap = image.toBitmap()
-            val rotation = image.imageInfo.rotationDegrees
-            rotatedBitmap = rotateForInference(sourceBitmap, rotation)
-            val mpImage = BitmapImageBuilder(rotatedBitmap).build()
-            val result = recognizer?.recognize(mpImage)
+            if (mouthDetector != null && ++mouthFrameCounter % 8 == 0) {
+                mouthDetector?.analyze(sourceBitmap, image.imageInfo.rotationDegrees)
+            }
+            val mpImage = BitmapImageBuilder(sourceBitmap).build()
+            val imageProcessingOptions = ImageProcessingOptions.builder()
+                .setRotationDegrees(image.imageInfo.rotationDegrees)
+                .build()
+            val frameTimestamp = synchronized(this) {
+                val now = SystemClock.uptimeMillis()
+                val timestamp = if (lastVideoTimestampMs == Long.MIN_VALUE) {
+                    now
+                } else {
+                    maxOf(now, lastVideoTimestampMs + 1L)
+                }
+                lastVideoTimestampMs = timestamp
+                timestamp
+            }
+            val result = recognizer?.recognizeForVideo(mpImage, imageProcessingOptions, frameTimestamp)
             if (result != null && started) {
                 handleResult(result)
             }
@@ -291,19 +328,9 @@ class GestureRecognizerController(
             // the UI when a single camera frame is malformed.
             publishErrorRateLimited(error)
         } finally {
-            if (rotatedBitmap != null && rotatedBitmap !== sourceBitmap) {
-                runCatching { rotatedBitmap.recycle() }
-            }
             runCatching { sourceBitmap?.recycle() }
             image.close()
         }
-    }
-
-    private fun rotateForInference(source: Bitmap, degrees: Int): Bitmap {
-        val normalized = ((degrees % 360) + 360) % 360
-        if (normalized == 0) return source
-        val matrix = Matrix().apply { postRotate(normalized.toFloat()) }
-        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
 
     private var lastErrorAt = Long.MIN_VALUE
@@ -348,6 +375,26 @@ class GestureRecognizerController(
         val centerDistance = abs(centerX - 0.5f) + abs(centerY - 0.5f)
         val centerQuality = (1f - centerDistance / 0.95f).coerceIn(0f, 1f)
         val handQuality = (sizeQuality * 0.65f + centerQuality * 0.35f).coerceIn(0f, 1f)
+
+        val palmSize = hypot(
+            (landmarks[0].x() - landmarks[9].x()).toDouble(),
+            (landmarks[0].y() - landmarks[9].y()).toDouble(),
+        ).toFloat().coerceAtLeast(0.001f)
+        val pinchDistance = hypot(
+            (landmarks[4].x() - landmarks[8].x()).toDouble(),
+            (landmarks[4].y() - landmarks[8].y()).toDouble(),
+        ).toFloat()
+        val pinchRatio = (pinchDistance / palmSize).coerceIn(0f, 3f)
+        val deltaX = if (previousCenterX.isNaN()) 0f else centerX - previousCenterX
+        val deltaY = if (previousCenterY.isNaN()) 0f else centerY - previousCenterY
+        previousCenterX = centerX
+        previousCenterY = centerY
+        if (lastMotionDispatchAt == Long.MIN_VALUE || now - lastMotionDispatchAt >= 50L) {
+            lastMotionDispatchAt = now
+            mainExecutor.execute {
+                safely { onMotion(HandMotion(centerX, centerY, deltaX, deltaY, pinchRatio, now)) }
+            }
+        }
 
         val categories = result.gestures().firstOrNull().orEmpty()
         val bestTarget = categories

@@ -13,6 +13,7 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaActionSound
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -29,6 +30,9 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.lifecycle.LifecycleService
 import com.samin.notouchgesture.R
+import com.samin.notouchgesture.control.CursorOverlayController
+import com.samin.notouchgesture.control.ShakeFlashlightController
+import com.samin.notouchgesture.control.TouchlessActionDispatcher
 import com.samin.notouchgesture.gesture.GestureRecognizerController
 import com.samin.notouchgesture.gesture.GestureStateMachine
 import com.samin.notouchgesture.nearby.NearbyRuntime
@@ -36,6 +40,8 @@ import com.samin.notouchgesture.nearby.NearbyTransferManager
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -83,6 +89,28 @@ class ScreenCaptureService : LifecycleService() {
     @Volatile private var gestureReady = false
     private lateinit var nearby: NearbyTransferManager
     private lateinit var captureStore: CaptureStore
+    private lateinit var visualFeedback: VisualFeedbackController
+    private lateinit var feedbackSettings: FeedbackSettings
+    private lateinit var mediaExecutor: ExecutorService
+    private var shutterSound: MediaActionSound? = null
+    private var lastNearbySending = false
+    private var lastNearbyReceiving = false
+    private var lastNearbyPreviewTransferId: String? = null
+    private var lastNearbyReceivedFile: File? = null
+
+    private lateinit var actionDispatcher: TouchlessActionDispatcher
+    private lateinit var shakeFlashlightController: ShakeFlashlightController
+    private lateinit var cursorOverlay: CursorOverlayController
+    private var motionWindowStart = 0L
+    private var motionStartX = 0f
+    private var motionStartY = 0f
+    private var pinchActive = false
+    private var pinchStartX = 0f
+    private var pinchStartY = 0f
+    private var pinchStartRatio = 0f
+    private var lastMotionActionAt = Long.MIN_VALUE
+    private var lastSwipeDirection = 0
+    private var lastSwipeAt = Long.MIN_VALUE
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var lastNotificationText: String? = null
@@ -99,13 +127,45 @@ class ScreenCaptureService : LifecycleService() {
     }
 
     private val nearbyStateListener: (NearbyTransferManager.State) -> Unit = { state ->
-        val received = state.lastReceivedFile
-        if (received != null && received != lastSavedReceived) {
-            lastSavedReceived = received
-            captureStore.saveLatest(received)
-        }
+        val becameSending = state.sending && !lastNearbySending
+        val becameReceiving = state.receiving && !lastNearbyReceiving
+        lastNearbySending = state.sending
+        lastNearbyReceiving = state.receiving
         nearbyPendingOffer = state.pendingOffer != null
+
+        if (becameSending) {
+            val file = captureStore.latestFile()
+            if (feedbackSettings.visualFeedbackEnabled) mainHandler.post { visualFeedback.showTransfer(file, VisualFeedbackController.Direction.SENDING) }
+        } else if (becameReceiving) {
+            if (feedbackSettings.visualFeedbackEnabled) mainHandler.post { visualFeedback.showTransfer(null, VisualFeedbackController.Direction.RECEIVING) }
+        }
+
+        if (state.previewTransferId != null && state.previewTransferId != lastNearbyPreviewTransferId && !state.previewBase64.isNullOrBlank()) {
+            lastNearbyPreviewTransferId = state.previewTransferId
+            val encoded = state.previewBase64
+            mediaExecutor.execute {
+                val bytes = runCatching { android.util.Base64.decode(encoded, android.util.Base64.DEFAULT) }.getOrNull()
+                val preview = bytes?.let { android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size) }
+                if (preview != null && alive && feedbackSettings.visualFeedbackEnabled) mainHandler.post { visualFeedback.updateTransferPreview(preview) }
+            }
+        }
+
+        val received = state.lastReceivedFile
+        if (received != null && received != lastSavedReceived && received != lastNearbyReceivedFile) {
+            lastSavedReceived = received
+            lastNearbyReceivedFile = received
+            captureStore.saveLatest(received)
+            mediaExecutor.execute {
+                val gallerySaved = MediaStoreSaver.saveToPictures(this, received)
+                if (alive && feedbackSettings.visualFeedbackEnabled) mainHandler.post { visualFeedback.showReceived(received, gallerySaved) }
+            }
+        }
+
         mainHandler.post {
+            if (state.message.startsWith("Screenshot delivered")) {
+                val file = captureStore.latestFile()
+                if (file != null && feedbackSettings.visualFeedbackEnabled) visualFeedback.showSent(file)
+            }
             refreshNotification()
             refreshWakeLock()
         }
@@ -142,6 +202,7 @@ class ScreenCaptureService : LifecycleService() {
         const val ACTION_GESTURE_STATE = "com.samin.notouchgesture.GESTURE_STATE"
         const val ACTION_NEARBY_STATE = "com.samin.notouchgesture.NEARBY_STATE"
         const val ACTION_CAPTURE_NOW = "com.samin.notouchgesture.CAPTURE_NOW"
+        const val ACTION_REFRESH_CONTROLS = "com.samin.notouchgesture.REFRESH_CONTROLS"
         const val ACTION_STOP = "com.samin.notouchgesture.STOP"
         const val ACTION_NEARBY_ADVERTISE = "com.samin.notouchgesture.NEARBY_ADVERTISE"
         const val ACTION_NEARBY_DISCOVER = "com.samin.notouchgesture.NEARBY_DISCOVER"
@@ -170,6 +231,13 @@ class ScreenCaptureService : LifecycleService() {
         captureThread = HandlerThread("PalmLink-Capture").also { it.start() }
         captureHandler = Handler(captureThread.looper)
         captureStore = CaptureStore(this)
+        visualFeedback = VisualFeedbackController(this)
+        actionDispatcher = TouchlessActionDispatcher(this)
+        cursorOverlay = CursorOverlayController(this)
+        shakeFlashlightController = ShakeFlashlightController(this, actionDispatcher)
+        feedbackSettings = FeedbackSettings(this)
+        mediaExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "PalmLink-Media") }
+        shutterSound = runCatching { MediaActionSound().also { it.load(MediaActionSound.SHUTTER_CLICK) } }.getOrNull()
         // The channel must exist before the first startForeground() call.
         createNotificationChannel()
         nearby = NearbyRuntime.get(this)
@@ -187,7 +255,7 @@ class ScreenCaptureService : LifecycleService() {
         } catch (error: Throwable) {
             if (error is VirtualMachineError) throw error
             Log.e(TAG, "Unhandled error while handling a service command", error)
-            degradeOrStop("PalmLink could not start: ${describe(error)}")
+            degradeOrStop("Aerviqo could not start: ${describe(error)}")
         }
         return START_STICKY
     }
@@ -205,8 +273,16 @@ class ScreenCaptureService : LifecycleService() {
                 running = false
                 captureReady = false
                 finishStarting()
-                broadcastState("PalmLink stopped.", running = false)
+                broadcastState("Aerviqo stopped.", running = false)
                 stopSelf() // onDestroy() tears down camera, projection and Nearby
+                return
+            }
+            ACTION_REFRESH_CONTROLS -> {
+                val settings = FeedbackSettings(this)
+                if (settings.flashlightGestureEnabled && gestureReady) shakeFlashlightController.start()
+                else shakeFlashlightController.stop()
+                if (!settings.cursorGestureEnabled) cursorOverlay.hide()
+                refreshNotification()
                 return
             }
             ACTION_CAPTURE_NOW -> {
@@ -229,7 +305,7 @@ class ScreenCaptureService : LifecycleService() {
         val withProjection = intent?.hasExtra(EXTRA_RESULT_CODE) == true
         if (!foregroundStarted && !promoteInitial(withProjection)) {
             Log.e(TAG, "Could not enter the foreground: $lastForegroundError")
-            broadcastState("PalmLink could not start: ${lastForegroundError ?: "Android refused the foreground service"}", running = false)
+            broadcastState("Aerviqo could not start: ${lastForegroundError ?: "Android refused the foreground service"}", running = false)
             finishStarting()
             stopSelf()
             return
@@ -360,7 +436,7 @@ class ScreenCaptureService : LifecycleService() {
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
         val resultData = intent.getParcelableExtraCompat<Intent>(EXTRA_RESULT_DATA)
         if (resultCode != Activity.RESULT_OK || resultData == null) {
-            degradeOrStop("Screen capture permission is required to enable PalmLink.")
+            degradeOrStop("Screen capture permission is required to enable Aerviqo.")
             return
         }
         if (!hasCameraPermission()) {
@@ -390,10 +466,10 @@ class ScreenCaptureService : LifecycleService() {
         running = true
         refreshWakeLock()
         refreshNotification()
-        Log.i(TAG, "PalmLink active (captureReady=$captureReady)")
+        Log.i(TAG, "Aerviqo active (captureReady=$captureReady)")
         broadcastState(
-            if (captureReady) "PalmLink is active. Use open palm → fist to capture."
-            else "PalmLink is active for receiving. Re-enable screen capture to take screenshots.",
+            if (captureReady) "Aerviqo is active. Use open palm → fist to capture."
+            else "Aerviqo is active for receiving. Re-enable screen capture to take screenshots.",
         )
     }
 
@@ -446,7 +522,7 @@ class ScreenCaptureService : LifecycleService() {
         reader.setOnImageAvailableListener({ source -> onFrameAvailable(source) }, captureHandler)
 
         virtualDisplay = newProjection.createVirtualDisplay(
-            "PalmLinkScreenCapture",
+            "AerviqoScreenCapture",
             size.width,
             size.height,
             size.densityDpi,
@@ -490,14 +566,18 @@ class ScreenCaptureService : LifecycleService() {
             receivePending = { nearbyPendingOffer },
             onReady = {
                 gestureReady = true
+                if (FeedbackSettings(this).flashlightGestureEnabled) shakeFlashlightController.start()
                 if (foregroundStarted) markRunning()
             },
             onFatalError = { message ->
                 Log.e(TAG, "Gesture engine fatal error: $message")
                 gestureReady = false
                 running = false
+                shakeFlashlightController.stop()
+                cursorOverlay.hide()
                 degradeOrStop(message)
             },
+            onMotion = ::handleHandMotion,
             onAction = { action ->
                 when (action) {
                     // Open palm -> fist: capture; the finished screenshot is sent automatically.
@@ -510,6 +590,89 @@ class ScreenCaptureService : LifecycleService() {
         )
         gestureController = controller
         controller.start()
+    }
+
+    private fun handleHandMotion(motion: GestureRecognizerController.HandMotion) {
+        val settings = FeedbackSettings(this)
+        if (!settings.extendedGesturesEnabled) {
+            if (pinchActive) {
+                pinchActive = false
+                cursorOverlay.hide()
+            }
+            return
+        }
+
+        if (settings.cursorGestureEnabled && cursorOverlay.canShow()) {
+            cursorOverlay.show(motion.centerX, motion.centerY)
+        }
+
+        val now = motion.timestampMs
+        val sensitiveDx = motion.deltaX * settings.gestureSensitivity
+        val sensitiveDy = motion.deltaY * settings.gestureSensitivity
+        val isPinch = motion.pinchRatio < 0.55f
+
+        if (isPinch && !pinchActive) {
+            pinchActive = true
+            pinchStartX = motion.centerX
+            pinchStartY = motion.centerY
+            pinchStartRatio = motion.pinchRatio
+            return
+        }
+
+        if (isPinch) {
+            if (settings.volumeGestureEnabled && kotlin.math.abs(sensitiveDy) >= 0.045f && now - lastMotionActionAt >= 180L) {
+                if (actionDispatcher.volumeByDelta(sensitiveDy)) lastMotionActionAt = now
+            } else if (settings.brightnessGestureEnabled && kotlin.math.abs(sensitiveDx) >= 0.045f && now - lastMotionActionAt >= 220L) {
+                if (actionDispatcher.setBrightness(sensitiveDx)) lastMotionActionAt = now
+            } else if (settings.cursorGestureEnabled && kotlin.math.abs(motion.pinchRatio - pinchStartRatio) >= 0.45f && now - lastMotionActionAt >= 500L) {
+                val zoomIn = motion.pinchRatio < pinchStartRatio
+                if (actionDispatcher.pinchAt(motion.centerX, motion.centerY, zoomIn)) lastMotionActionAt = now
+                pinchStartRatio = motion.pinchRatio
+            }
+            return
+        }
+
+        if (pinchActive) {
+            pinchActive = false
+            if (settings.cursorGestureEnabled && now - lastMotionActionAt >= 180L) {
+                actionDispatcher.tapAt(motion.centerX, motion.centerY)
+            }
+            return
+        }
+
+        if (motionWindowStart == 0L || now - motionWindowStart > 500L) {
+            motionWindowStart = now
+            motionStartX = motion.centerX
+            motionStartY = motion.centerY
+            return
+        }
+
+        val dx = motion.centerX - motionStartX
+        val dy = motion.centerY - motionStartY
+        if (now - lastMotionActionAt >= 650L) {
+            if (settings.scrollGestureEnabled && kotlin.math.abs(dy) >= 0.16f && kotlin.math.abs(dy) > kotlin.math.abs(dx) * 1.15f) {
+                if (actionDispatcher.scroll(dy < 0f)) {
+                    lastMotionActionAt = now
+                    motionWindowStart = now
+                }
+            } else if (kotlin.math.abs(dx) >= 0.18f && kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.15f) {
+                val direction = if (dx < 0f) -1 else 1
+                var success = false
+                if (settings.navigationGestureEnabled && lastSwipeDirection == direction && now - lastSwipeAt <= 1200L) {
+                    success = if (direction < 0) actionDispatcher.back() else actionDispatcher.home()
+                    lastSwipeDirection = 0
+                    lastSwipeAt = Long.MIN_VALUE
+                } else if (settings.mediaGestureEnabled) {
+                    success = if (direction < 0) actionDispatcher.mediaPrevious() else actionDispatcher.mediaNext()
+                    lastSwipeDirection = direction
+                    lastSwipeAt = now
+                }
+                if (success) {
+                    lastMotionActionAt = now
+                    motionWindowStart = now
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -546,8 +709,18 @@ class ScreenCaptureService : LifecycleService() {
         }
         if (!captureInFlight.compareAndSet(false, true)) return
         broadcastState(if (source == "gesture") "Gesture recognized. Capturing…" else "Capturing…")
+        val feedbackWasVisible = feedbackSettings.visualFeedbackEnabled && visualFeedback.isActive()
+        if (feedbackWasVisible) mainHandler.post { visualFeedback.clear() }
         val posted = try {
-            captureHandler.post { captureLatestFrame() }
+            // If visual feedback was already on screen, give the display composition a moment to
+            // settle before taking the next frame so the previous overlay can never become part
+            // of a subsequent screenshot.
+            if (feedbackWasVisible) {
+                captureHandler.postDelayed({ captureLatestFrame() }, 180L)
+            } else {
+                captureHandler.post { captureLatestFrame() }
+            }
+            true
         } catch (error: Exception) {
             false
         }
@@ -629,6 +802,14 @@ class ScreenCaptureService : LifecycleService() {
             return
         }
         captureStore.saveLatest(output)
+        mainHandler.post {
+            if (feedbackSettings.shutterSoundEnabled) runCatching { shutterSound?.play(MediaActionSound.SHUTTER_CLICK) }
+            if (feedbackSettings.visualFeedbackEnabled) visualFeedback.showCapture(output, gallerySaved = false)
+        }
+        mediaExecutor.execute {
+            val gallerySaved = MediaStoreSaver.saveToPictures(this, output)
+            if (alive && feedbackSettings.visualFeedbackEnabled) mainHandler.post { visualFeedback.updateCaptureGallerySaved(gallerySaved) }
+        }
         sendBroadcast(
             Intent(ACTION_CAPTURE_COMPLETE)
                 .setPackage(packageName)
@@ -737,11 +918,15 @@ class ScreenCaptureService : LifecycleService() {
         }
         if (::captureHandler.isInitialized) runCatching { captureHandler.removeCallbacksAndMessages(null) }
         if (::captureThread.isInitialized) runCatching { captureThread.quitSafely() }
+        runCatching { visualFeedback.clear() }
+        runCatching { shutterSound?.release() }
+        shutterSound = null
+        if (::mediaExecutor.isInitialized) runCatching { mediaExecutor.shutdownNow() }
         runCatching {
             sendBroadcast(
                 Intent(ACTION_SERVICE_STATE)
                     .setPackage(packageName)
-                    .putExtra(EXTRA_MESSAGE, "PalmLink stopped.")
+                    .putExtra(EXTRA_MESSAGE, "Aerviqo stopped.")
                     .putExtra(EXTRA_RUNNING, false)
                     .putExtra(EXTRA_CAPTURE_READY, false),
             )
@@ -763,7 +948,7 @@ class ScreenCaptureService : LifecycleService() {
             val needed = running || (::nearby.isInitialized && nearby.isActive())
             var lock = wakeLock
             if (lock == null) {
-                lock = getSystemService<PowerManager>()?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PalmLink:session")
+                lock = getSystemService<PowerManager>()?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Aerviqo:session")
                 lock?.setReferenceCounted(false)
                 wakeLock = lock
             }
@@ -793,7 +978,7 @@ class ScreenCaptureService : LifecycleService() {
             peer != null -> "Connected to $peer"
             s.advertising -> "Visible to nearby devices"
             s.discovering -> "Looking for nearby devices"
-            else -> "PalmLink is running"
+            else -> "Aerviqo is running"
         }
     }
 
@@ -831,7 +1016,7 @@ class ScreenCaptureService : LifecycleService() {
         .build()
 
     private fun defaultStatusLine(): String =
-        if (::nearby.isInitialized) statusLine() else "PalmLink is running"
+        if (::nearby.isInitialized) statusLine() else "Aerviqo is running"
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return

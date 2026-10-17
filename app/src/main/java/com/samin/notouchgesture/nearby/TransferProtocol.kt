@@ -2,10 +2,8 @@ package com.samin.notouchgesture.nearby
 
 /**
  * Wire messages exchanged over the Nearby BYTES channel. The screenshot itself always travels
- * as a separate FILE payload (streamed by Google Play services, never loaded into memory).
- *
- * Flow:  sender OFFER -> receiver ACCEPT (after the receive gesture) -> sender FILE payload
- *        -> receiver RESULT (after size + SHA-256 + PNG verification).
+ * as a separate FILE payload. A small optional PREVIEW message is sent only after the receiver
+ * accepts the screenshot, so older builds can still complete the original OFFER/ACCEPT/FILE flow.
  */
 sealed interface TransferMessage {
     data class Offer(
@@ -18,6 +16,7 @@ sealed interface TransferMessage {
         val senderName: String = "",
     ) : TransferMessage
 
+    data class Preview(val transferId: String, val base64Jpeg: String) : TransferMessage
     data class Accept(val transferId: String) : TransferMessage
     data class Reject(val transferId: String, val reason: String) : TransferMessage
     data class Cancel(val transferId: String) : TransferMessage
@@ -34,10 +33,11 @@ sealed interface TransferMessage {
 
 object TransferProtocol {
     private const val SEP = "|"
-    private const val MAX_MESSAGE_CHARS = 1024
+    private const val MAX_MESSAGE_CHARS = 16_384
     private val ID_REGEX = Regex("^[A-Za-z0-9-]{8,64}$")
     private val SHA_REGEX = Regex("^[0-9a-fA-F]{64}$")
     private val MIME_REGEX = Regex("^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$")
+    private val PREVIEW_REGEX = Regex("^[A-Za-z0-9+/=_-]{64,14000}$")
 
     fun isValidTransferId(value: String): Boolean = ID_REGEX.matches(value)
 
@@ -53,6 +53,7 @@ object TransferProtocol {
                 message.createdAtMs.toString(),
                 sanitize(message.senderName),
             ).joinToString(SEP)
+            is TransferMessage.Preview -> "PREVIEW$SEP${message.transferId}$SEP${message.base64Jpeg}"
             is TransferMessage.Accept -> "ACCEPT$SEP${message.transferId}"
             is TransferMessage.Reject -> "REJECT$SEP${message.transferId}$SEP${sanitize(message.reason)}"
             is TransferMessage.Cancel -> "CANCEL$SEP${message.transferId}"
@@ -61,9 +62,9 @@ object TransferProtocol {
             is TransferMessage.Ping -> "PING$SEP${sanitize(message.value)}"
             is TransferMessage.PairSetup -> "PAIR$SEP${message.deviceId}$SEP${message.token}"
             is TransferMessage.AuthHello -> "AUTHH$SEP${message.deviceId}$SEP${message.nonce}"
-            is TransferMessage.AuthResponse ->
-                "AUTHR$SEP${message.deviceId}$SEP${message.challenge}$SEP${message.proof}"
+            is TransferMessage.AuthResponse -> "AUTHR$SEP${message.deviceId}$SEP${message.challenge}$SEP${message.proof}"
         }
+        require(line.length <= MAX_MESSAGE_CHARS) { "Nearby control message is too large" }
         return line.toByteArray(Charsets.UTF_8)
     }
 
@@ -82,6 +83,12 @@ object TransferProtocol {
                 val mime = parts[5].takeIf { MIME_REGEX.matches(it) } ?: return null
                 val created = parts[6].toLongOrNull() ?: return null
                 TransferMessage.Offer(id, name, size, sha, mime, created, parts[7])
+            }
+            "PREVIEW" -> {
+                if (parts.size != 3) return null
+                val id = parts[1].takeIf(::isValidTransferId) ?: return null
+                val preview = parts[2].takeIf { PREVIEW_REGEX.matches(it) } ?: return null
+                TransferMessage.Preview(id, preview)
             }
             "ACCEPT" -> if (parts.size == 2) parts[1].takeIf(::isValidTransferId)?.let { TransferMessage.Accept(it) } else null
             "REJECT" -> {

@@ -1,4 +1,5 @@
 package com.samin.notouchgesture
+import com.samin.notouchgesture.accessibility.TouchlessAccessibilityService
 
 import android.Manifest
 import android.app.Activity
@@ -9,9 +10,14 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.media.projection.MediaProjectionManager
+import android.speech.RecognizerIntent
+import android.widget.Toast
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -57,6 +63,7 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -78,6 +85,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.samin.notouchgesture.capture.CaptureStore
+import com.samin.notouchgesture.capture.FeedbackSettings
 import com.samin.notouchgesture.capture.MediaStoreSaver
 import com.samin.notouchgesture.capture.ScreenCaptureService
 import com.samin.notouchgesture.gesture.GestureRecognizerController
@@ -85,6 +93,7 @@ import com.samin.notouchgesture.gesture.GestureStateMachine
 import com.samin.notouchgesture.nearby.NearbyRuntime
 import com.samin.notouchgesture.nearby.NearbyTransferManager
 import com.samin.notouchgesture.ui.NoTouchTheme
+import com.samin.notouchgesture.ui.AerviqoSettingsDialog
 import com.samin.notouchgesture.ui.SectionCard
 import com.samin.notouchgesture.ui.StatusChip
 import com.samin.notouchgesture.ui.ThemeMenu
@@ -105,7 +114,7 @@ class MainActivity : ComponentActivity() {
     private var latestCaptureState = mutableStateOf<File?>(null)
     private var nearbyState = mutableStateOf(NearbyTransferManager.State())
     private var themeState = mutableStateOf(ThemeMode.AUTO)
-    private var backgroundState = mutableStateOf("PalmLink is not running in the background")
+    private var backgroundState = mutableStateOf("Aerviqo is not running in the background")
     private var backgroundRunningState = mutableStateOf(ScreenCaptureService.running)
     private var captureReadyState = mutableStateOf(ScreenCaptureService.captureReady)
     private var lastHandledReceived: File? = null
@@ -118,6 +127,17 @@ class MainActivity : ComponentActivity() {
             ScreenCaptureService.finishStarting()
             backgroundRunningState.value = false
             backgroundState.value = "Screen-capture permission was canceled."
+        }
+    }
+
+    private val airMicLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val text = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.trim().orEmpty()
+        if (text.isBlank()) return@registerForActivityResult
+        val inserted = TouchlessAccessibilityService.get()?.insertText(text) == true
+        if (!inserted) {
+            val clipboard = getSystemService(ClipboardManager::class.java)
+            clipboard?.setPrimaryClip(ClipData.newPlainText("Aerviqo Air Mic", text))
+            Toast.makeText(this, "Voice text copied. Tap a text field and paste it.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -178,7 +198,7 @@ class MainActivity : ComponentActivity() {
         lastHandledReceived = nearby.currentState().lastReceivedFile
         backgroundRunningState.value = ScreenCaptureService.running
         captureReadyState.value = ScreenCaptureService.captureReady
-        if (ScreenCaptureService.running) backgroundState.value = "PalmLink is running in the background."
+        if (ScreenCaptureService.running) backgroundState.value = "Aerviqo is running in the background."
         nearby.addStateListener(nearbyStateListener)
         latestCaptureState.value = captureStore.latestFile()
         themeState.value = ThemeStore(this).get()
@@ -210,6 +230,11 @@ class MainActivity : ComponentActivity() {
                         themeState.value = it
                         themeStore.set(it)
                     },
+                    onSettingsChanged = {
+                        refreshControlSettings()
+                    },
+                    onRequestMicrophone = ::requestMicrophonePermissions,
+                    onAirMic = ::launchAirMic,
                     latestCapture = latestCaptureState.value,
                     nearbyState = nearbyState.value,
                     onRequestCamera = ::requestCameraPermissions,
@@ -272,7 +297,7 @@ class MainActivity : ComponentActivity() {
             if (action == ScreenCaptureService.ACTION_NEARBY_STOP) startService(intent)
             else ContextCompat.startForegroundService(this, intent)
         }.onFailure { error ->
-            backgroundState.value = "Could not start PalmLink Nearby: ${error.message ?: "Android rejected the request"}"
+            backgroundState.value = "Could not start Aerviqo Nearby: ${error.message ?: "Android rejected the request"}"
         }
     }
 
@@ -290,7 +315,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (!ScreenCaptureService.tryBeginStarting()) {
-            backgroundState.value = "PalmLink background mode is already starting."
+            backgroundState.value = "Aerviqo background mode is already starting."
             return
         }
 
@@ -311,7 +336,7 @@ class MainActivity : ComponentActivity() {
         if (ScreenCaptureService.captureReady) {
             ScreenCaptureService.finishStarting()
             backgroundRunningState.value = ScreenCaptureService.running
-            backgroundState.value = "PalmLink is already running in the background."
+            backgroundState.value = "Aerviqo is already running in the background."
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -323,7 +348,7 @@ class MainActivity : ComponentActivity() {
             putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
             putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, data)
         }
-        backgroundState.value = "Starting PalmLink background mode…"
+        backgroundState.value = "Starting Aerviqo background mode…"
         if (ScreenCaptureService.running) {
             // Only the projection ended; the service's camera engine is still up and is re-used.
             // Stopping the "active" controller here would stop that engine.
@@ -348,7 +373,7 @@ class MainActivity : ComponentActivity() {
             }.onFailure { error ->
                 ScreenCaptureService.finishStarting()
                 backgroundRunningState.value = ScreenCaptureService.running
-                backgroundState.value = "PalmLink could not start: ${error.message ?: "Android rejected the service start"}"
+                backgroundState.value = "Aerviqo could not start: ${error.message ?: "Android rejected the service start"}"
             }
         }, 150L)
     }
@@ -357,6 +382,7 @@ class MainActivity : ComponentActivity() {
         val permissions = buildList {
             add(Manifest.permission.CAMERA)
             if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+            if (Build.VERSION.SDK_INT <= 28) add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         }
         permissionsLauncher.launch(permissions.toTypedArray())
     }
@@ -374,10 +400,34 @@ class MainActivity : ComponentActivity() {
             }
             if (Build.VERSION.SDK_INT >= 33) {
                 add(Manifest.permission.NEARBY_WIFI_DEVICES)
-                add(Manifest.permission.POST_NOTIFICATIONS) // shows the PalmLink status notification
+                add(Manifest.permission.POST_NOTIFICATIONS) // shows the Aerviqo status notification
             }
         }
         permissionsLauncher.launch(permissions.toTypedArray())
+    }
+
+    private fun requestMicrophonePermissions() {
+        permissionsLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+    }
+
+    private fun launchAirMic() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestMicrophonePermissions()
+            return
+        }
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Aerviqo Air Mic")
+        }
+        runCatching { airMicLauncher.launch(intent) }.onFailure {
+            Toast.makeText(this, "Voice input is unavailable on this device.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun refreshControlSettings() {
+        if (!ScreenCaptureService.alive) return
+        val intent = Intent(this, ScreenCaptureService::class.java).setAction(ScreenCaptureService.ACTION_REFRESH_CONTROLS)
+        runCatching { startService(intent) }
     }
 
     private fun shareFile(file: File) {
@@ -403,6 +453,9 @@ private enum class AppTab(val label: String) {
 private fun NoTouchApp(
     themeMode: ThemeMode,
     onThemeChange: (ThemeMode) -> Unit,
+    onSettingsChanged: () -> Unit,
+    onRequestMicrophone: () -> Unit,
+    onAirMic: () -> Unit,
     latestCapture: File?,
     nearbyState: NearbyTransferManager.State,
     onRequestCamera: () -> Unit,
@@ -425,17 +478,19 @@ private fun NoTouchApp(
 ) {
     var tab by remember { mutableStateOf(AppTab.HOME) }
     var showInfo by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Column {
-                        Text("PalmLink", fontWeight = FontWeight.Bold)
+                        Text("Aerviqo", fontWeight = FontWeight.Bold)
                         Text("Touchless control, built responsibly", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 },
                 actions = {
+                    IconButton(onClick = { showSettings = true }) { Icon(Icons.Filled.Settings, contentDescription = "Settings") }
                     IconButton(onClick = { showInfo = true }) { Icon(Icons.Filled.Info, contentDescription = "Information") }
                     ThemeMenu(themeMode, onThemeChange)
                 },
@@ -483,6 +538,7 @@ private fun NoTouchApp(
                 captureReady = captureReady,
                 backgroundState = backgroundState,
                 backgroundGestureState = backgroundGestureState,
+                onAirMic = onAirMic,
             )
             AppTab.NEARBY -> NearbyScreen(
                 modifier = Modifier.padding(padding),
@@ -502,13 +558,21 @@ private fun NoTouchApp(
         }
     }
 
+    if (showSettings) {
+        AerviqoSettingsDialog(
+            onDismiss = { showSettings = false },
+            onSettingsChanged = onSettingsChanged,
+            onRequestMicrophone = onRequestMicrophone,
+        )
+    }
+
     if (showInfo) {
         AlertDialog(
             onDismissRequest = { showInfo = false },
-            title = { Text("How this prototype works") },
+            title = { Text("How Aerviqo works") },
             text = {
                 Text(
-                    "Gesture detection runs locally with the front camera. PalmLink uses a user-visible Android foreground service for background gestures and MediaProjection for screen capture. The system requires user consent when background capture is enabled. Nearby transfer stays device-to-device and uses the platform connection authentication flow."
+                    "Gesture detection runs locally with the front camera. Aerviqo uses a user-visible Android foreground service for background gestures and MediaProjection for screen capture. The system requires user consent when background capture is enabled. Nearby transfer stays device-to-device and uses the platform connection authentication flow."
                 )
             },
             confirmButton = { TextButton(onClick = { showInfo = false }) { Text("Done") } },
@@ -538,7 +602,7 @@ private fun HomeScreen(
                 shape = RoundedCornerShape(28.dp),
             ) {
                 Column(Modifier.padding(24.dp)) {
-                    StatusChip("PalmLink • Android")
+                    StatusChip("Aerviqo • Android")
                     Spacer(Modifier.height(14.dp))
                     Text("Control your screen without touching it.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
@@ -557,7 +621,7 @@ private fun HomeScreen(
         item {
             SectionCard(
                 title = "Capture",
-                body = "Enable PalmLink once, approve Android screen capture, and the foreground service keeps the gesture listener alive while you use other apps.",
+                body = "Enable Aerviqo once, approve Android screen capture, and the foreground service keeps the gesture listener alive while you use other apps.",
                 actionLabel = "Start screen capture",
                 onAction = onCapture,
             )
@@ -578,7 +642,7 @@ private fun HomeScreen(
         item {
             SectionCard(
                 title = "Privacy by default",
-                body = "Gesture inference is local. Screenshots remain in app storage until you export or share them. Nearby transfer is device-to-device, without a cloud upload path.",
+                body = "Gesture inference is local. Screenshots are automatically saved to Pictures/Aerviqo on capture or receipt, and Nearby transfer is device-to-device without a cloud upload path.",
             )
         }
         if (latestCapture != null) {
@@ -623,8 +687,13 @@ private fun LatestCaptureCard(file: File, onSaveGallery: (File) -> Boolean, onDe
             }
             Spacer(Modifier.height(10.dp))
             Text(file.name, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "Automatically saved to Pictures/Aerviqo when captured or received.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { saveState = if (onSaveGallery(file)) "Saved to Pictures" else "Could not save" }) { Text("Save to gallery") }
+                Button(onClick = { saveState = if (onSaveGallery(file)) "Saved to Pictures" else "Could not save" }) { Text("Save again") }
                 TextButton(onClick = { onShare(file) }) { Text("Share") }
                 TextButton(onClick = { saveState = if (onDeleteCapture(file)) "Deleted from app storage" else "Could not delete" }) { Text("Delete") }
             }
@@ -642,10 +711,12 @@ private fun GestureScreen(
     captureReady: Boolean,
     backgroundState: String,
     backgroundGestureState: GestureRecognizerController.GestureUiState,
+    onAirMic: () -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var hasCameraPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
+    var hasMicPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
     var uiState by remember { mutableStateOf(GestureRecognizerController.GestureUiState()) }
     var actionText by remember { mutableStateOf("") }
@@ -654,6 +725,7 @@ private fun GestureScreen(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasCameraPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                hasMicPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -662,7 +734,7 @@ private fun GestureScreen(
 
     Column(modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("Gesture Lab", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text("The recognizer uses the front camera locally. PalmLink can keep the gesture listener alive in a visible foreground service while you use another app.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("The recognizer uses the front camera locally. Aerviqo can keep the gesture listener alive in a visible foreground service while you use another app.", color = MaterialTheme.colorScheme.onSurfaceVariant)
 
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
             Column(Modifier.padding(18.dp)) {
@@ -674,7 +746,7 @@ private fun GestureScreen(
                     Button(onClick = onRequestCapture, enabled = hasCameraPermission) {
                         Icon(Icons.Filled.ScreenShare, null)
                         Spacer(Modifier.width(8.dp))
-                        Text("Enable PalmLink")
+                        Text("Enable Aerviqo")
                     }
                 } else {
                     StatusChip("RUNNING IN BACKGROUND")
@@ -753,7 +825,7 @@ private fun GestureScreen(
         }
     }
 
-    DisposableEffect(previewView, hasCameraPermission, backgroundRunning) {
+    DisposableEffect(previewView, hasCameraPermission, hasMicPermission, backgroundRunning) {
         val pv = previewView
         if (!hasCameraPermission || pv == null || backgroundRunning) {
             onDispose { }
@@ -764,6 +836,7 @@ private fun GestureScreen(
                 previewView = pv,
                 mode = GestureStateMachine.GestureMode.CAPTURE,
                 onState = { uiState = it },
+                onMouthOpen = if (FeedbackSettings(context).airMicEnabled && hasMicPermission) onAirMic else null,
                 onAction = { action ->
                     when (action) {
                         GestureStateMachine.Action.CAPTURE -> {
@@ -933,7 +1006,7 @@ private fun NearbyGesturePanel(
                     fontWeight = FontWeight.SemiBold,
                 )
                 Spacer(Modifier.height(6.dp))
-                Text("Make a fist, then open your palm to receive the incoming screenshot. Enable PalmLink on the Gesture tab to do this from other apps.")
+                Text("Make a fist, then open your palm to receive the incoming screenshot. Enable Aerviqo on the Gesture tab to do this from other apps.")
                 Spacer(Modifier.height(12.dp))
 
                 if (!hasCameraPermission) {

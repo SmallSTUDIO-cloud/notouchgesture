@@ -18,9 +18,13 @@ class LogicSmokeTest {
     @Test fun backgroundOpenFirstWhilePendingResetsTest() = backgroundOpenFirstWhilePendingResets()
     @Test fun staleArmingExpiresTest() = staleArmingExpires()
     @Test fun heldGestureTriggersOnceTest() = heldGestureTriggersOnce()
+    @Test fun defaultFastSequenceWorksTest() = defaultFastSequenceWorks()
+    @Test fun briefConfidenceDipDoesNotRestartGestureTest() = briefConfidenceDipDoesNotRestartGesture()
+    @Test fun longConfidenceLossResetsGestureTest() = longConfidenceLossResetsGesture()
     @Test fun wrongOrderDoesNotTriggerTest() = wrongOrderDoesNotTrigger()
     @Test fun protocolRoundTripWorksTest() = protocolRoundTripWorks()
     @Test fun protocolControlMessagesRoundTripTest() = protocolControlMessagesRoundTrip()
+    @Test fun protocolPreviewRoundTripTest() = protocolPreviewRoundTrip()
     @Test fun protocolPairingMessagesRoundTripTest() = protocolPairingMessagesRoundTrip()
     @Test fun pairingCryptoRoundTripTest() = pairingCryptoRoundTrip()
     @Test fun invalidMessagesAreRejectedTest() = invalidMessagesAreRejected()
@@ -115,9 +119,12 @@ private fun staleArmingExpires() {
     val sm = Sm(GestureStateMachine.GestureMode.BACKGROUND, stableMs = 100)
     check(sm.update(L.OPEN_PALM, 0.9f, 0L) == A.NONE)
     check(sm.update(L.OPEN_PALM, 0.9f, 100L) == A.ARMED)
-    check(sm.update(L.NONE, 0f, 5000L) == A.NONE)
-    check(sm.update(L.CLOSED_FIST, 0.9f, 5100L) == A.NONE)
-    check(sm.update(L.CLOSED_FIST, 0.9f, 5200L) == A.ARMED)
+    // The production arm timeout is 2.5s, comfortably above the short two-step
+    // gesture window. Advance beyond that timeout
+    // before starting the next gesture sequence.
+    check(sm.update(L.NONE, 0f, 7000L) == A.NONE)
+    check(sm.update(L.CLOSED_FIST, 0.9f, 7100L) == A.NONE)
+    check(sm.update(L.CLOSED_FIST, 0.9f, 7200L) == A.ARMED)
 }
 
 private fun heldGestureTriggersOnce() {
@@ -135,6 +142,40 @@ private fun heldGestureTriggersOnce() {
     check(captures == 1)
 }
 
+private fun defaultFastSequenceWorks() {
+    val sm = Sm(GestureStateMachine.GestureMode.BACKGROUND)
+
+    // Production defaults are intentionally quick: roughly 180 ms per gesture step.
+    check(sm.update(L.OPEN_PALM, 0.9f, 0L) == A.NONE)
+    check(sm.update(L.OPEN_PALM, 0.9f, 179L) == A.NONE)
+    check(sm.update(L.OPEN_PALM, 0.9f, 180L) == A.ARMED)
+
+    check(sm.update(L.CLOSED_FIST, 0.9f, 181L) == A.NONE)
+    check(sm.update(L.CLOSED_FIST, 0.9f, 359L) == A.NONE)
+    check(sm.update(L.CLOSED_FIST, 0.9f, 361L) == A.CAPTURE)
+}
+
+private fun briefConfidenceDipDoesNotRestartGesture() {
+    val sm = Sm(GestureStateMachine.GestureMode.CAPTURE, stableMs = 180, confidenceGraceMs = 140)
+    check(sm.update(L.OPEN_PALM, 0.9f, 0L) == A.NONE)
+    check(sm.update(L.OPEN_PALM, 0.9f, 100L) == A.NONE)
+    // A brief weak frame should not restart the stable-window timer.
+    check(sm.update(L.OPEN_PALM, 0.40f, 150L) == A.NONE)
+    check(sm.update(L.OPEN_PALM, 0.9f, 180L) == A.ARMED)
+}
+
+private fun longConfidenceLossResetsGesture() {
+    val sm = Sm(GestureStateMachine.GestureMode.CAPTURE, stableMs = 180, confidenceGraceMs = 140)
+    check(sm.update(L.OPEN_PALM, 0.9f, 0L) == A.NONE)
+    check(sm.update(L.OPEN_PALM, 0.9f, 100L) == A.NONE)
+
+    // After the grace window expires, the previous stable time cannot be reused.
+    check(sm.update(L.OPEN_PALM, 0.40f, 250L) == A.NONE)
+    check(sm.update(L.OPEN_PALM, 0.9f, 260L) == A.NONE)
+    check(sm.update(L.OPEN_PALM, 0.9f, 439L) == A.NONE)
+    check(sm.update(L.OPEN_PALM, 0.9f, 440L) == A.ARMED)
+}
+
 private fun wrongOrderDoesNotTrigger() {
     val sm = Sm(GestureStateMachine.GestureMode.CAPTURE, stableMs = 100)
     check(sm.update(L.CLOSED_FIST, 0.9f, 0L) == A.NONE)
@@ -149,6 +190,12 @@ private fun protocolRoundTripWorks() {
     check(TransferProtocol.decode(TransferProtocol.encode(offer)) == offer)
     val noName = offer.copy(senderName = "")
     check(TransferProtocol.decode(TransferProtocol.encode(noName)) == noName)
+}
+
+private fun protocolPreviewRoundTrip() {
+    val preview = TransferMessage.Preview(TID, "A".repeat(128))
+    check(TransferProtocol.decode(TransferProtocol.encode(preview)) == preview)
+    check(TransferProtocol.decode("PREVIEW|$TID|bad!".toByteArray()) == null)
 }
 
 private fun protocolControlMessagesRoundTrip() {

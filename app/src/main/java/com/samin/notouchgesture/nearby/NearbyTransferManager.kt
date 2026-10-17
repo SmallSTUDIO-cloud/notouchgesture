@@ -2,6 +2,9 @@ package com.samin.notouchgesture.nearby
 
 import android.Manifest
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Base64
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -24,6 +27,7 @@ import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.security.MessageDigest
@@ -70,6 +74,8 @@ class NearbyTransferManager(
         val lastReceivedFile: File? = null,
         val sending: Boolean = false,
         val receiving: Boolean = false,
+        val previewBase64: String? = null,
+        val previewTransferId: String? = null,
     )
 
     private enum class Role { NONE, ADVERTISE, DISCOVER }
@@ -132,6 +138,7 @@ class NearbyTransferManager(
     private var queuedFile: File? = null
     private var queuedAt = 0L
     private var offerExpiry: Runnable? = null
+    private val pendingPreviews = ConcurrentHashMap<String, String>()
 
     @Volatile
     private var authorizedUntil = 0L
@@ -210,8 +217,16 @@ class NearbyTransferManager(
             }
             .addOnFailureListener { error ->
                 acceptingConnection.set(false)
-                updateState {
-                    it.copy(message = "Could not accept connection: ${friendlyError(error)}")
+                if (isAlreadyConnected(error)) {
+                    pendingConnections.remove(endpointId)
+                    activeEndpoints += endpointId
+                    stopRadios()
+                    updateState { it.copy(connected = true, discovering = false, advertising = false, pendingConnectionEndpointId = null, authDigits = null, message = "Nearby connected. Securing the paired device…") }
+                    beginAuthentication(endpointId)
+                } else {
+                    updateState {
+                        it.copy(message = "Could not accept connection: ${friendlyError(error)}")
+                    }
                 }
             }
         return true
@@ -333,7 +348,7 @@ class NearbyTransferManager(
             it.copy(
                 discovering = false,
                 advertising = false,
-                message = if (stopDiscovery) "Preparing nearby visibility…" else "Making PalmLink visible…",
+                message = if (stopDiscovery) "Preparing nearby visibility…" else "Making Aerviqo visible…",
             )
         }
         operationHandler.post { beginAdvertising(token, 0) }
@@ -525,7 +540,7 @@ class NearbyTransferManager(
             }
             updateState {
                 it.copy(message = if (activeEndpoints.isEmpty())
-                    "No PalmLink device connected. The screenshot is saved and will be offered when a device connects."
+                    "No Aerviqo device connected. The screenshot is saved and will be offered when a device connects."
                 else
                     "Nearby is securing the connection. The screenshot is queued for automatic delivery.")
             }
@@ -559,7 +574,7 @@ class NearbyTransferManager(
             }
         }
 
-        updateState { it.copy(sending = true, progress = 0, message = "Preparing screenshot…") }
+        updateState { it.copy(sending = true, progress = 0, message = "Preparing screenshot…", previewBase64 = null, previewTransferId = null) }
         ioExecutor.execute {
             val sha = try {
                 sha256Of(file)
@@ -634,7 +649,25 @@ class NearbyTransferManager(
         } ?: return
         out.timeout?.let { operationHandler.removeCallbacks(it) }
         updateState { it.copy(message = "Receiver accepted. Sending screenshot…", progress = 0) }
-        sendFilePayload(out)
+        ioExecutor.execute {
+            val preview = createPreviewBase64(out.file)
+            operationHandler.post {
+                if (!isOutgoingCurrent(out)) return@post
+                val peer = authenticatedEndpoints.firstOrNull()
+                if (peer == null) {
+                    failOutgoing(out, "The device is no longer authenticated.", requeue = true, notifyPeer = false)
+                    return@post
+                }
+                if (!preview.isNullOrBlank()) {
+                    sendMessage(
+                        peer,
+                        TransferMessage.Preview(out.id, preview),
+                        onFailure = { error -> Log.w(TAG, "Screenshot preview message failed", error) },
+                    )
+                }
+                sendFilePayload(out)
+            }
+        }
     }
 
     private fun sendFilePayload(out: Outgoing) {
@@ -708,7 +741,11 @@ class NearbyTransferManager(
         }
         if (!owned) return
         out.timeout?.let { operationHandler.removeCallbacks(it) }
-        updateState { it.copy(sending = false, progress = 0, message = message) }
+        val wasSuccess = message.startsWith("Screenshot delivered")
+        updateState { it.copy(sending = false, progress = 0, message = message, previewBase64 = null, previewTransferId = null) }
+        if (wasSuccess) {
+            // The service owns the visual confirmation; the manager only exposes transfer state.
+        }
         flushQueued()
     }
 
@@ -733,7 +770,7 @@ class NearbyTransferManager(
             activeEndpoints.firstOrNull()?.let { sendMessage(it, TransferMessage.Cancel(out.id)) }
         }
         Log.w(TAG, "Outgoing transfer ${out.id} failed: $message")
-        updateState { it.copy(sending = false, progress = 0, message = message) }
+        updateState { it.copy(sending = false, progress = 0, message = message, previewBase64 = null, previewTransferId = null) }
     }
 
     /** Offers a screenshot that was captured while no peer was connected (if still fresh). */
@@ -785,7 +822,14 @@ class NearbyTransferManager(
         offerExpiry = null
         authorizedUntil = 0L
         updateState {
-            it.copy(pendingOffer = null, receiving = true, progress = 0, message = "Accepted. Receiving the screenshot…")
+            it.copy(
+                pendingOffer = null,
+                receiving = true,
+                progress = 0,
+                previewBase64 = it.previewBase64 ?: pendingPreviews[offer.transferId],
+                previewTransferId = offer.transferId,
+                message = "Accepted. Receiving the screenshot…",
+            )
         }
         touchIncoming(inc)
         sendMessage(
@@ -796,6 +840,18 @@ class NearbyTransferManager(
             },
         )
         return true
+    }
+
+    private fun onPreviewReceived(endpointId: String, message: TransferMessage.Preview) {
+        if (!authenticatedEndpoints.contains(endpointId)) return
+        if (message.base64Jpeg.length > 14_000) return
+        pendingPreviews[message.transferId] = message.base64Jpeg
+        val relevant = synchronized(transferLock) {
+            incoming?.offer?.transferId == message.transferId
+        } || state.pendingOffer?.transferId == message.transferId
+        if (relevant) {
+            updateState { it.copy(previewBase64 = message.base64Jpeg, previewTransferId = message.transferId) }
+        }
     }
 
     private fun onOfferReceived(endpointId: String, offer: TransferMessage.Offer) {
@@ -819,7 +875,8 @@ class NearbyTransferManager(
         offerExpiry?.let { operationHandler.removeCallbacks(it) }
         val expiry = Runnable {
             if (state.pendingOffer?.transferId == offer.transferId) {
-                updateState { it.copy(pendingOffer = null, message = "The screenshot offer expired.") }
+                pendingPreviews.remove(offer.transferId)
+                updateState { it.copy(pendingOffer = null, previewBase64 = null, previewTransferId = null, message = "The screenshot offer expired.") }
                 activeEndpoints.firstOrNull()?.let {
                     sendMessage(it, TransferMessage.Reject(offer.transferId, "Offer expired"))
                 }
@@ -832,6 +889,8 @@ class NearbyTransferManager(
             it.copy(
                 pendingOffer = offer,
                 progress = 0,
+                previewBase64 = pendingPreviews[offer.transferId],
+                previewTransferId = offer.transferId,
                 message = "Screenshot incoming. Make a fist, then open your palm to receive it.",
             )
         }
@@ -846,7 +905,8 @@ class NearbyTransferManager(
         if (state.pendingOffer?.transferId == message.transferId) {
             offerExpiry?.let { operationHandler.removeCallbacks(it) }
             offerExpiry = null
-            updateState { it.copy(pendingOffer = null, message = "The sender cancelled the screenshot.") }
+            pendingPreviews.remove(message.transferId)
+            updateState { it.copy(pendingOffer = null, previewBase64 = null, previewTransferId = null, message = "The sender cancelled the screenshot.") }
         }
         val inc = synchronized(transferLock) { incoming?.takeIf { it.offer.transferId == message.transferId } }
         if (inc != null) failIncoming(inc, "The sender cancelled the transfer.", notifySender = false)
@@ -902,7 +962,8 @@ class NearbyTransferManager(
             }
         }
         Log.w(TAG, "Incoming transfer ${inc.offer.transferId} failed: $message")
-        updateState { it.copy(receiving = false, progress = 0, message = message) }
+        pendingPreviews.remove(inc.offer.transferId)
+        updateState { it.copy(receiving = false, progress = 0, previewBase64 = null, previewTransferId = null, message = message) }
     }
 
     private fun finishIncoming(inc: Incoming) {
@@ -928,11 +989,14 @@ class NearbyTransferManager(
                     return@post
                 }
                 val saved = outcome.file
+                pendingPreviews.remove(offer.transferId)
                 if (saved != null) {
                     updateState {
                         it.copy(
                             receiving = false,
                             progress = 100,
+                            previewBase64 = null,
+                            previewTransferId = null,
                             message = "Screenshot received and saved.",
                             lastReceivedFile = saved,
                         )
@@ -944,7 +1008,7 @@ class NearbyTransferManager(
                     val reason = outcome.error ?: "verification failed"
                     Log.w(TAG, "Rejected incoming ${offer.transferId}: $reason")
                     updateState {
-                        it.copy(receiving = false, progress = 0, message = "The received screenshot was rejected: $reason")
+                        it.copy(receiving = false, progress = 0, previewBase64 = null, previewTransferId = null, message = "The received screenshot was rejected: $reason")
                     }
                     activeEndpoints.firstOrNull()?.let {
                         sendMessage(it, TransferMessage.Result(offer.transferId, false, reason))
@@ -1043,8 +1107,29 @@ class NearbyTransferManager(
                 .addOnFailureListener { error ->
                     pendingConnections.remove(endpointId)
                     discoveredEndpoints.remove(endpointId)
-                    updateState { it.copy(message = "Connection request failed: ${friendlyError(error)}") }
-                    scheduleRoleResume(force = true)
+                    when {
+                        isAlreadyConnected(error) -> {
+                            // Nearby can report 8003 when the transport completed the connection
+                            // just before the request task delivered its failure callback. Treat
+                            // the endpoint as connected instead of starting a second connection.
+                            activeEndpoints += endpointId
+                            stopRadios()
+                            updateState { it.copy(connected = true, discovering = false, advertising = false, message = "Nearby connected. Securing the paired device…") }
+                            beginAuthentication(endpointId)
+                        }
+                        isOutOfOrder(error) -> {
+                            // 8009 means the Nearby API received an operation while its strategy
+                            // state was still settling. Stop radios and use the existing bounded
+                            // role-resume path instead of looping the same request immediately.
+                            stopRadios()
+                            updateState { it.copy(message = "Nearby is finishing the previous operation…") }
+                            scheduleRoleResume(force = true)
+                        }
+                        else -> {
+                            updateState { it.copy(message = "Connection request failed: ${friendlyError(error)}") }
+                            scheduleRoleResume(force = true)
+                        }
+                    }
                 }
         }
 
@@ -1234,6 +1319,7 @@ class NearbyTransferManager(
                 if (!authenticatedEndpoints.contains(endpointId)) return
                 when (message) {
                     is TransferMessage.Offer -> onOfferReceived(endpointId, message)
+                    is TransferMessage.Preview -> onPreviewReceived(endpointId, message)
                     is TransferMessage.Accept -> onAcceptReceived(message)
                     is TransferMessage.Reject -> onRejectReceived(message)
                     is TransferMessage.Cancel -> onCancelReceived(message)
@@ -1288,8 +1374,10 @@ class NearbyTransferManager(
         offerExpiry?.let { operationHandler.removeCallbacks(it) }
         offerExpiry = null
         authorizedUntil = 0L
+        finishedInc?.offer?.transferId?.let(pendingPreviews::remove)
+        synchronized(pendingPreviews) { pendingPreviews.keys.toList().forEach { key -> if (key != state.previewTransferId) pendingPreviews.remove(key) } }
         discardPayloadUri(finishedInc?.uri)
-        updateState { it.copy(pendingOffer = null, progress = 0, sending = false, receiving = false) }
+        updateState { it.copy(pendingOffer = null, progress = 0, sending = false, receiving = false, previewBase64 = null, previewTransferId = null) }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1314,7 +1402,7 @@ class NearbyTransferManager(
 
     /** Human-readable endpoint name with a short persistent identity hint. The hint is not a credential. */
     private fun localEndpointName(): String {
-        val model = Build.MODEL.orEmpty().replace("#", "").take(18).ifBlank { "PalmLink" }
+        val model = Build.MODEL.orEmpty().replace("#", "").take(18).ifBlank { "Aerviqo" }
         // Include only a short persistent identity hint in the human-readable endpoint name.
         // It is NOT used as authentication; the HMAC handshake below is the credential.
         return "$model#${localDeviceId().take(16)}"
@@ -1323,7 +1411,7 @@ class NearbyTransferManager(
     private fun localDeviceId(): String = prefs.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString().replace("-", "")
         .also { prefs.edit().putString(KEY_DEVICE_ID, it).apply() }
 
-    private fun displayName(raw: String): String = raw.substringBefore('#').ifBlank { "PalmLink device" }
+    private fun displayName(raw: String): String = raw.substringBefore('#').ifBlank { "Aerviqo device" }
 
     private fun trustedSecrets(): Map<String, String> {
         val entries = prefs.getStringSet(KEY_TRUSTED_SECRETS, emptySet()).orEmpty()
@@ -1432,6 +1520,44 @@ class NearbyTransferManager(
         prefs.edit().remove(KEY_QUEUED_FILE).remove(KEY_QUEUED_AT).apply()
     }
 
+    private fun isOutgoingCurrent(out: Outgoing): Boolean = synchronized(transferLock) { outgoing === out }
+
+    /** Encodes a small JPEG thumbnail for the in-transfer animation. It is sent only after ACCEPT. */
+    private fun createPreviewBase64(file: File): String? = runCatching {
+        if (!file.isFile) return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (bounds.outWidth / sample > 320 || bounds.outHeight / sample > 320) sample *= 2
+        val bitmap = BitmapFactory.decodeFile(
+            file.absolutePath,
+            BitmapFactory.Options().apply { inSampleSize = sample; inPreferredConfig = Bitmap.Config.ARGB_8888 },
+        ) ?: return null
+        try {
+            val maxSide = maxOf(bitmap.width, bitmap.height)
+            val scaled = if (maxSide > 320) {
+                val scale = 320f / maxSide
+                Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt().coerceAtLeast(1), (bitmap.height * scale).toInt().coerceAtLeast(1), true)
+            } else bitmap
+            try {
+                var quality = 62
+                var encoded: String
+                do {
+                    val bytes = ByteArrayOutputStream()
+                    scaled.compress(Bitmap.CompressFormat.JPEG, quality, bytes)
+                    encoded = Base64.encodeToString(bytes.toByteArray(), Base64.NO_WRAP)
+                    quality -= 10
+                } while (encoded.length > 12_000 && quality >= 32)
+                encoded.takeIf { it.length <= 14_000 }
+            } finally {
+                if (scaled !== bitmap) scaled.recycle()
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }.getOrNull()
+
     private fun sha256Of(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         FileInputStream(file).use { input ->
@@ -1482,6 +1608,12 @@ class NearbyTransferManager(
     private fun isAlreadyDiscovering(error: Exception): Boolean =
         statusCode(error) == STATUS_ALREADY_DISCOVERING || error.message?.contains("ALREADY_DISCOVERING", true) == true
 
+    private fun isAlreadyConnected(error: Exception): Boolean =
+        statusCode(error) == STATUS_ALREADY_CONNECTED || error.message?.contains("ALREADY_CONNECTED", true) == true
+
+    private fun isOutOfOrder(error: Exception): Boolean =
+        statusCode(error) == STATUS_OUT_OF_ORDER || error.message?.contains("OUT_OF_ORDER", true) == true
+
     companion object {
         private const val TAG = "PalmLink"
         private const val PREFS = "palmlink_nearby"
@@ -1497,6 +1629,8 @@ class NearbyTransferManager(
 
         private const val STATUS_ALREADY_ADVERTISING = 8001
         private const val STATUS_ALREADY_DISCOVERING = 8002
+        private const val STATUS_ALREADY_CONNECTED = 8003
+        private const val STATUS_OUT_OF_ORDER = 8009
         private const val MAX_TRANSFER_BYTES = 50L * 1024L * 1024L
 
         /** How long a screenshot offer stays valid on both phones. */

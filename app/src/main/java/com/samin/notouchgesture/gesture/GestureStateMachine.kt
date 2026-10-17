@@ -1,26 +1,28 @@
 package com.samin.notouchgesture.gesture
 
 /**
- * Debounces MediaPipe labels into deliberate gesture sequences.
+ * Debounces MediaPipe predictions into deliberate gesture sequences.
  *
  * CAPTURE:    open palm -> closed fist
  * SEND:       closed fist -> open palm (legacy, send-offer semantics)
  * RECEIVE:    closed fist -> open palm (authorizes the incoming screenshot)
  * BACKGROUND: open palm -> closed fist captures (and the service auto-sends it);
  *             closed fist -> open palm authorizes the incoming screenshot.
- *             If an offer is already pending, an open-palm-first sequence is ignored and
- *             reset rather than being converted into a hidden third-step gesture.
  *
- * A half-completed sequence expires after [armTimeoutMs], so an open palm shown minutes
- * ago can never combine with a later fist.
+ * The recognizer is intended for natural, quick hand motions. Each step therefore uses a
+ * short stable window, with a small confidence grace period to tolerate normal frame jitter.
  */
 class GestureStateMachine(
     private val mode: GestureMode,
     private val minConfidence: Float = 0.50f,
-    private val stableMs: Long = 220L,
-    private val neutralRearmMs: Long = 180L,
-    private val cooldownMs: Long = 600L,
-    private val armTimeoutMs: Long = 4_000L,
+    /** Continuous stable window required before a gesture step is accepted. */
+    private val stableMs: Long = 180L,
+    private val neutralRearmMs: Long = 120L,
+    private val cooldownMs: Long = 450L,
+    /** Maximum time allowed between the two deliberate steps of a sequence. */
+    private val armTimeoutMs: Long = 2_500L,
+    /** Brief low-confidence gaps are tolerated while the same gesture remains visible. */
+    private val confidenceGraceMs: Long = 140L,
 ) {
     enum class GestureMode { CAPTURE, SEND, RECEIVE, BACKGROUND }
 
@@ -40,6 +42,7 @@ class GestureStateMachine(
 
     private var candidate = Label.NONE
     private var candidateSince = 0L
+    private var lastStrongAt = Long.MIN_VALUE
     private var currentStable = Label.NONE
     private var armed = false
     private var armedSequence: Label? = null
@@ -51,6 +54,7 @@ class GestureStateMachine(
     fun reset() {
         candidate = Label.NONE
         candidateSince = 0L
+        lastStrongAt = Long.MIN_VALUE
         currentStable = Label.NONE
         armed = false
         armedSequence = null
@@ -63,35 +67,58 @@ class GestureStateMachine(
     fun update(label: Label, confidence: Float, nowMs: Long, receivePending: Boolean = false): Action {
         expireStaleArming(nowMs)
 
-        val effective = if (confidence >= minConfidence) label else Label.NONE
+        val safeConfidence = confidence.coerceIn(0f, 1f)
+        val strong = label != Label.NONE && safeConfidence >= minConfidence
 
-        if (effective != candidate) {
-            candidate = effective
+        if (label != candidate) {
+            candidate = label
             candidateSince = nowMs
+            lastStrongAt = if (strong) nowMs else Long.MIN_VALUE
+        } else if (strong) {
+            lastStrongAt = nowMs
+        } else if (label != Label.NONE && lastStrongAt != Long.MIN_VALUE && nowMs - lastStrongAt > confidenceGraceMs) {
+            // The confidence gap is now long enough that the old stable window must not be
+            // reused when confidence returns. Treat this as a fresh candidate next time.
+            candidate = Label.NONE
+            candidateSince = nowMs
+            lastStrongAt = Long.MIN_VALUE
         }
 
-        if (nowMs - candidateSince < stableMs) return Action.NONE
-
-        if (currentStable == effective && !waitingForNeutral) {
-            return Action.NONE
+        // A brief confidence dip should not make the user restart a gesture. Once the
+        // grace window expires, the recognizer becomes neutral and must stabilize again.
+        val effective = when {
+            strong -> label
+            label != Label.NONE && lastStrongAt != Long.MIN_VALUE && nowMs - lastStrongAt <= confidenceGraceMs -> label
+            else -> Label.NONE
         }
-
-        currentStable = effective
 
         if (waitingForNeutral) {
             if (effective == Label.NONE) {
-                if (neutralSince == Long.MIN_VALUE) neutralSince = candidateSince
+                if (neutralSince == Long.MIN_VALUE) neutralSince = nowMs
                 if (nowMs - neutralSince >= neutralRearmMs) {
                     waitingForNeutral = false
-                    disarm()
                     neutralSince = Long.MIN_VALUE
+                    disarm()
                     currentStable = Label.NONE
+                    candidate = Label.NONE
+                    candidateSince = nowMs
+                    lastStrongAt = Long.MIN_VALUE
                 }
             } else {
                 neutralSince = Long.MIN_VALUE
             }
             return Action.NONE
         }
+
+        if (effective == Label.NONE) {
+            currentStable = Label.NONE
+            return Action.NONE
+        }
+
+        if (nowMs - candidateSince < stableMs) return Action.NONE
+
+        if (currentStable == effective) return Action.NONE
+        currentStable = effective
 
         if (lastActionAt != Long.MIN_VALUE && nowMs - lastActionAt < cooldownMs) return Action.NONE
 
@@ -106,8 +133,10 @@ class GestureStateMachine(
     private fun expireStaleArming(nowMs: Long) {
         if (armed && !waitingForNeutral && armedAt != Long.MIN_VALUE && nowMs - armedAt > armTimeoutMs) {
             disarm()
-            // Forget the stable label so a hand that is still held can arm again.
             currentStable = Label.NONE
+            candidate = Label.NONE
+            candidateSince = nowMs
+            lastStrongAt = Long.MIN_VALUE
         }
     }
 
@@ -151,8 +180,7 @@ class GestureStateMachine(
         }
         armedSequence == Label.OPEN_PALM && label == Label.CLOSED_FIST -> {
             if (receivePending) {
-                // Do not silently turn OPEN_PALM -> FIST into a three-step receive gesture.
-                // The user must perform the documented FIST -> OPEN_PALM receive gesture.
+                // Do not silently turn OPEN_PALM -> FIST into a receive gesture.
                 disarm()
                 currentStable = Label.NONE
                 Action.NONE

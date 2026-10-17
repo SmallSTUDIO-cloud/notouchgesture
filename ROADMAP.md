@@ -1,26 +1,28 @@
-# PalmLink roadmap
+# Aerviqo roadmap
 
-## Completed in this revision
+## Included in 0.5.0
 
-- Persistent foreground-service camera gesture recognition.
-- Persistent MediaProjection session for gesture-triggered screenshots.
-- No repeated screen-capture consent dialog for each gesture.
-- Safe foreground-to-background CameraX/MediaPipe ownership handoff.
-- Synchronous MediaPipe inference with correct frame rotation and safe bitmap lifetime.
-- More tolerant palm/fist recognition with landmark fallback and lower-latency state machine.
-- Idempotent Nearby advertising/discovery with duplicate-start handling.
-- Shared Nearby manager between Activity and foreground service.
-- Background screenshot send/receive for already authenticated Nearby connections.
-- PalmLink branding and app icon.
-- Android permission matrix and foreground-service declarations cleaned up.
-- CI SDK installation workflow updated for API 37.0.
+- Aerviqo branding and supplied logo.
+- Persistent background gesture engine retained from the working baseline.
+- Automatic Gallery saving.
+- Shutter sound and visual feedback.
+- Transfer/receive preview feedback.
+- Faster temporal gesture tracking.
+- Settings and gesture manual.
+- Optional air controls: scroll, swipe, volume, brightness, cursor/select, zoom, Back/Home and media commands.
+- Shake flashlight.
+- Foreground-only experimental mouth-open Air Mic.
+- Nearby 8003/8009 recovery handling.
 
-## Final physical-device validation
+## Final validation still required
 
-- Android 11/12/13/14/15 on several device families.
-- Samsung foreground-service and background-camera behavior.
-- Camera thermal/battery measurements.
-- MediaProjection revocation and recovery.
+- Android build and unit tests in the configured Codespace.
+- Two-phone capture/send/receive test.
+- Background operation after leaving Aerviqo.
+- Samsung/OEM camera and foreground-service behavior.
+- MediaProjection revocation/recovery.
 - Nearby interruption/reconnection and large-file transfer.
-- OEM battery-optimization behavior.
-- Instrumented UI tests and service lifecycle tests.
+- Gallery publication and duplicate prevention.
+- Visual feedback and shutter sound settings.
+- AccessibilityService controls and overlay permission behavior.
+- Flashlight debounce and Air Mic behavior on the target Android version.

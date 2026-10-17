@@ -45,8 +45,8 @@ android {
         applicationId = "com.samin.notouchgesture"
         minSdk = 24
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.1"
+        versionCode = 5
+        versionName = "0.5.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -102,6 +102,7 @@ dependencies {
     implementation("androidx.camera:camera-view:1.6.2")
 
     implementation("com.google.mediapipe:tasks-vision:1.0.0")
+    implementation("com.google.mlkit:face-detection:16.1.7")
     implementation("com.google.android.gms:play-services-nearby:19.5.0")
 
     testImplementation("junit:junit:4.13.2")
