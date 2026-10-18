@@ -1,0 +1,5 @@
+{
+  "name": "Aerviqo 0.5.0",
+  "description": "Touchless gesture air control, Nearby file sharing, and environmental background services for Android Native.",
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

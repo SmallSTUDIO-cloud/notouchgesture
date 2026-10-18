@@ -1,0 +1,11 @@
+{
+  "name": "aerviqo-applet",
+  "version": "0.5.0",
+  "description": "Aerviqo 0.5.0 Native Android App and Web Distribution Portal",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
